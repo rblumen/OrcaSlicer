@@ -544,6 +544,40 @@ void PrintObject::make_perimeters()
     m_print->set_status(15, L("Generating walls"));
     BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
 
+    // Orca: A modifier with a ramped transition shares the walls of the region it modifies, unless Layer::make_perimeters()
+    // keeps the two apart, which leaves the hard step at its outline. Warn about that, with the reason the merge gives.
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges)
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
+            if (volume_region.parent < 0)
+                continue;
+            const PrintRegion &modifier = *volume_region.region;
+            const PrintRegion &parent   = *layer_range.volume_regions[volume_region.parent].region;
+            if (&modifier == &parent || modifier.wall_ramp_base_loops() < 0 || modifier.config().wall_loops == parent.config().wall_loops)
+                continue;
+            const bool same_gradient = modifier.gradient_volume_id() == parent.gradient_volume_id();
+            if (same_gradient && Layer::is_perimeter_compatible(*m_print, modifier, parent))
+                continue;
+            // A modifier overlapping only the bounding box of the region has nothing to merge.
+            const int region_id = modifier.print_object_region_id();
+            if (std::none_of(m_layers.begin(), m_layers.end(), [region_id](const Layer *layer) { return ! layer->get_region(region_id)->slices.empty(); }))
+                continue;
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                ! modifier.has_wall_ramp() ?
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs "
+                                        "a taper ratio above 0."),
+                                   volume_region.model_volume->name, this->model_object()->name) :
+                ! same_gradient ?
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition is not "
+                                        "available together with a per-part gradient."),
+                                   volume_region.model_volume->name, this->model_object()->name) :
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs "
+                                        "the same wall settings as the part except for the wall loops."),
+                                   volume_region.model_volume->name, this->model_object()->name));
+        }
+
     // Revert the typed slices into untyped slices, together with the anchors handed to bridges by a previous run.
     for (Layer *layer : m_layers) {
         layer->restore_untyped_slices();
@@ -1517,6 +1551,8 @@ bool PrintObject::invalidate_state_by_config_options(
             }
         } else if (
                opt_key == "wall_loops"
+            || opt_key == "wall_loops_transition"
+            || opt_key == "wall_ramp_taper_ratio"
             || opt_key == "alternate_extra_wall"
             || opt_key == "top_one_wall_type"
             || opt_key == "min_width_top_surface"
