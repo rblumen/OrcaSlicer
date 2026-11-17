@@ -544,6 +544,29 @@ void PrintObject::make_perimeters()
     m_print->set_status(15, L("Generating walls"));
     BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
 
+    // Orca: A Ramp modifier its region cannot taper into keeps the hard step at its outline, see Layer::is_wall_ramp().
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges)
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
+            if (volume_region.parent < 0 || ! volume_region.model_volume->is_region_modifier())
+                continue;
+            const PrintRegion &modifier = *volume_region.region;
+            const PrintRegion &parent   = *layer_range.volume_regions[volume_region.parent].region;
+            if (modifier.config().wall_loops_transition != WallLoopsTransition::Ramp || modifier.config().wall_loops == parent.config().wall_loops)
+                continue;
+            if (! Layer::is_wall_ramp(modifier.config(), parent.config()) && ! Layer::is_wall_ramp(parent.config(), modifier.config()))
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs more "
+                                        "wall loops than the part and a taper ratio above 0."),
+                                   volume_region.model_volume->name, this->model_object()->name));
+            else if (! Layer::is_perimeter_compatible(*m_print, modifier, parent))
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs "
+                                        "the same wall settings as the part except for the wall loops."),
+                                   volume_region.model_volume->name, this->model_object()->name));
+        }
+
     // Revert the typed slices into untyped slices, together with the anchors handed to bridges by a previous run.
     for (Layer *layer : m_layers) {
         layer->restore_untyped_slices();
@@ -1517,6 +1540,8 @@ bool PrintObject::invalidate_state_by_config_options(
             }
         } else if (
                opt_key == "wall_loops"
+            || opt_key == "wall_loops_transition"
+            || opt_key == "wall_ramp_taper_ratio"
             || opt_key == "alternate_extra_wall"
             || opt_key == "top_one_wall_type"
             || opt_key == "min_width_top_surface"

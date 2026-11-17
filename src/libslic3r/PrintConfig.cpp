@@ -376,6 +376,13 @@ static t_config_enum_values s_keys_map_WallDirection{
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WallDirection)
 
 //Orca
+static t_config_enum_values s_keys_map_WallLoopsTransition{
+    { "hard", int(WallLoopsTransition::Hard) },
+    { "ramp", int(WallLoopsTransition::Ramp) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WallLoopsTransition)
+
+//Orca
 static t_config_enum_values s_keys_map_SurfaceFillOrder{
     { "default",  int(SurfaceFillOrder::Default) },
     { "outward",  int(SurfaceFillOrder::Outward) },
@@ -5973,6 +5980,32 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->set_default_value(new ConfigOptionInt(2));
     
+    def = this->add("wall_loops_transition", coEnum);
+    def->label = L("Wall count transition");
+    def->category = L("Strength");
+    def->tooltip = L("How the wall count changes at the boundary of a modifier that sets a different number of walls.\n\n"
+                     "Hard: the modifier gets closed walls of its own around its outline, including inside the part.\n"
+                     "Ramp: the modifier shares the walls of the part, and the walls thicken gradually from the part's wall count "
+                     "to the modifier's, over the taper ratio. The modifier needs more wall loops than the part.");
+    def->enum_keys_map = &ConfigOptionEnum<WallLoopsTransition>::get_enum_values();
+    def->enum_values.push_back("hard");
+    def->enum_values.push_back("ramp");
+    // TRN: A wall count transition: the wall count changes in one step at the modifier's outline.
+    def->enum_labels.push_back(L("Hard"));
+    // TRN: A wall count transition: the wall count changes gradually, over a taper.
+    def->enum_labels.push_back(L("Ramp"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<WallLoopsTransition>(WallLoopsTransition::Hard));
+
+    def = this->add("wall_ramp_taper_ratio", coFloat);
+    def->label = L("Wall ramp taper ratio");
+    def->category = L("Strength");
+    def->tooltip = L("With the Ramp wall count transition, the length over which the walls thicken, per unit of added wall thickness. "
+                     "For example, 10 thickens the walls by 1 mm over 10 mm. Must be greater than 0.");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(10.));
+
     def = this->add("alternate_extra_wall", coBool);
     def->label = L("Alternate extra wall");
     def->category = L("Strength");

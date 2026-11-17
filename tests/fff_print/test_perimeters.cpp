@@ -24,6 +24,9 @@
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Polyline.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/PrintBase.hpp"
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <utility>
@@ -1565,4 +1568,170 @@ TEST_CASE("Changing the brim updates the wall order of the first layer", "[Perim
     // The change does turn the first layer around.
     REQUIRE(before != fresh);
     CHECK(after == fresh);
+}
+
+namespace {
+
+// A layer inside the 2mm tall part, away from its top and bottom shells.
+const double ramp_layer_z = 1.0;
+
+// A 20x20x2 part with wall_loops 2, and a 10x30 modifier over its +X side whose outline crosses the part along
+// x = 15, so the modifier covers the strip x = 15..20 of the part and the rest of it sticks out of the part.
+Print &part_with_wall_modifier(Print &print, Model &model, const DynamicPrintConfig &config, const DynamicPrintConfig &modifier_config)
+{
+    Test::init_print({ make_cube(20., 20., 2.) }, print, model, config, nullptr, false);
+    TriangleMesh modifier = make_cube(10., 30., 4.);
+    modifier.translate(15.f, -5.f, -1.f);
+    model.objects.front()->add_volume(std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, false)->config.apply(modifier_config);
+    print.apply(model, config);
+    print.process();
+    return print;
+}
+
+// Every setting the wall positions below depend on, so none of them rests on a default.
+DynamicPrintConfig wall_ramp_config(const char *wall_generator)
+{
+    DynamicPrintConfig config = base_config(wall_generator);
+    config.set_deserialize_strict({
+        { "wall_loops",            2 },
+        { "nozzle_diameter",       "0.4" },
+        { "line_width",            0.45 },
+        { "outer_wall_line_width", 0.45 },
+        { "inner_wall_line_width", 0.45 },
+        { "outer_wall_speed",      "60" },
+    });
+    return config;
+}
+
+DynamicPrintConfig wall_modifier_config(std::initializer_list<ConfigBase::SetDeserializeItem> items)
+{
+    DynamicPrintConfig config;
+    config.set_deserialize_strict({ { "wall_loops", 4 } });
+    config.set_deserialize_strict(items);
+    return config;
+}
+
+const Layer *layer_at(const Print &print, double print_z)
+{
+    for (const Layer *layer : print.objects().front()->layers())
+        if (std::abs(layer->print_z - print_z) < EPSILON)
+            return layer;
+    return nullptr;
+}
+
+// Wall length the layer extrudes inside the part within 1.5mm of the modifier's outline at x = 15, away from the
+// part's outline. Only walls closing the modifier's region, or the part's region around it, run there.
+double buried_wall_length(const Layer &layer)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const BoundingBox strip(Point(part.min.x() + scaled<coord_t>(13.5), part.min.y() + scaled<coord_t>(3.)),
+                            Point(part.min.x() + scaled<coord_t>(16.5), part.max.y() - scaled<coord_t>(3.)));
+    Polylines walls;
+    for (const LayerRegion *region : layer.regions())
+        append(walls, region->perimeters.as_polylines());
+    return unscaled<double>(total_length(intersection_pl(walls, strip.polygon())));
+}
+
+size_t regions_with_walls(const Layer &layer)
+{
+    return (size_t)std::count_if(layer.regions().begin(), layer.regions().end(), [](const LayerRegion *region) { return ! region->perimeters.empty(); });
+}
+
+std::string perimeter_warnings(const Print &print)
+{
+    std::string text;
+    for (const auto &warning : print.objects().front()->step_state_with_warnings(posPerimeters).warnings)
+        text += warning.message;
+    return text;
+}
+
+} // namespace
+
+// Hard gives the modifier closed walls of its own, so walls run inside the part along the modifier's outline. Ramp
+// merges the modifier's region with the part's, which walls the outline of the part only.
+TEST_CASE("A Ramp modifier shares the part's walls instead of walling its outline inside the part", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print hard_print, ramp_print;
+    Model hard_model, ramp_model;
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator), wall_modifier_config({}));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator), wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    const Layer *hard = layer_at(hard_print, ramp_layer_z);
+    const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
+    REQUIRE(hard != nullptr);
+    REQUIRE(ramp != nullptr);
+
+    // At least one wall of each region along the 14mm of the strip.
+    CHECK(buried_wall_length(*hard) > 2. * 14.);
+    CHECK(regions_with_walls(*hard) == 2);
+    CHECK_THAT(buried_wall_length(*ramp), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(regions_with_walls(*ramp) == 1);
+    CHECK(perimeter_warnings(ramp_print).empty());
+}
+
+// The taper ratio only acts with Ramp, so a Hard modifier slices as one that sets neither key.
+TEST_CASE("A Hard modifier slices as one without the wall count transition settings", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print unset_print, hard_print;
+    Model unset_model, hard_model;
+    part_with_wall_modifier(unset_print, unset_model, wall_ramp_config(wall_generator), wall_modifier_config({}));
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator),
+                            wall_modifier_config({ { "wall_loops_transition", "hard" }, { "wall_ramp_taper_ratio", 5. } }));
+    const SliceLengths unset = slice_lengths(unset_print);
+    const SliceLengths hard  = slice_lengths(hard_print);
+    REQUIRE(unset.perimeters.size() == hard.perimeters.size());
+    CHECK_THAT(max_difference(unset.perimeters, hard.perimeters), Catch::Matchers::WithinAbs(0., 1.));
+    CHECK_THAT(max_difference(unset.fills,      hard.fills),      Catch::Matchers::WithinAbs(0., 1.));
+    CHECK(perimeter_warnings(hard_print).empty());
+}
+
+// Ramp needs more wall loops on the modifier than on the part and a taper ratio above 0, and the part's walls can only
+// be shared when the rest of the wall settings agree. Otherwise the modifier keeps its own walls, with a warning.
+TEST_CASE("A Ramp modifier that cannot share the part's walls keeps the hard step and warns", "[Perimeters][WallRamp]")
+{
+    const std::string case_name = GENERATE("fewer wall loops", "zero taper ratio", "other wall speed");
+    CAPTURE(case_name);
+    DynamicPrintConfig modifier_config = wall_modifier_config({ { "wall_loops_transition", "ramp" } });
+    if (case_name == "fewer wall loops")
+        modifier_config.set_deserialize_strict({ { "wall_loops", 1 } });
+    else if (case_name == "zero taper ratio")
+        modifier_config.set_deserialize_strict({ { "wall_ramp_taper_ratio", 0. } });
+    else
+        modifier_config.set_deserialize_strict({ { "outer_wall_speed", "30" } });
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("classic"), modifier_config);
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK(buried_wall_length(*layer) > 2. * 14.);
+    CHECK(regions_with_walls(*layer) == 2);
+    CHECK_FALSE(perimeter_warnings(print).empty());
+}
+
+// Switching a modifier to Ramp regenerates the walls from the existing slices.
+TEST_CASE("Switching a modifier to Ramp regenerates its walls without reslicing", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    const DynamicPrintConfig config = wall_ramp_config("classic");
+    part_with_wall_modifier(print, model, config, wall_modifier_config({}));
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    REQUIRE(buried_wall_length(*layer_at(print, ramp_layer_z)) > 2. * 14.);
+
+    ModelVolume *modifier = model.objects.front()->volumes.back();
+    REQUIRE(modifier->is_modifier());
+    modifier->config.apply(wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    print.apply(model, config);
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    CHECK_FALSE(print.objects().front()->is_step_done(posPerimeters));
+
+    print.process();
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    CHECK_THAT(buried_wall_length(*layer_at(print, ramp_layer_z)), Catch::Matchers::WithinAbs(0., 0.5));
 }

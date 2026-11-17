@@ -378,6 +378,60 @@ TEST_CASE("Volumetric per-extruder exclusions survive a 3MF round-trip", "[3mf][
     CHECK(legacy->serialize() == "0x0,10x0,10x10,0x10");
 }
 
+TEST_CASE("A modifier's wall count transition survives a project round trip", "[3mf][Config]")
+{
+    ScopedSlic3rTemporaryDir temporary_dir("orca_wall_ramp");
+
+    Model model;
+    ModelObject *object = model.add_object();
+    object->add_volume(make_cube(20.0, 20.0, 10.0));
+    DynamicPrintConfig modifier_config;
+    modifier_config.set_deserialize_strict({
+        { "wall_loops",            4 },
+        { "wall_loops_transition", "ramp" },
+        { "wall_ramp_taper_ratio", 7.5 },
+    });
+    object->add_volume(make_cube(10.0, 10.0, 10.0), ModelVolumeType::PARAMETER_MODIFIER)->config.apply(modifier_config);
+    object->add_instance();
+
+    DynamicPrintConfig project;
+    model.set_backup_path((temporary_dir.path() / "source_backup").string());
+    const std::string path = (temporary_dir.path() / "wall_ramp.3mf").string();
+    auto plate = std::make_unique<PlateData>();
+    plate->plate_index = 0;
+    StoreParams store_params;
+    store_params.path = path.c_str();
+    store_params.model = &model;
+    store_params.config = &project;
+    store_params.plate_data_list.push_back(plate.get());
+    store_params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(store_params));
+
+    Model reloaded_model;
+    DynamicPrintConfig reloaded;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Disable};
+    PlateDataPtrs reloaded_plates;
+    std::vector<Preset *> project_presets;
+    bool is_bbl_3mf = false;
+    bool is_orca_3mf = false;
+    Semver file_version;
+    const bool loaded = load_bbs_3mf(path.c_str(), &reloaded, &substitutions, &reloaded_model, &reloaded_plates,
+        &project_presets, &is_bbl_3mf, &is_orca_3mf, &file_version, nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+    release_PlateData_list(reloaded_plates);
+    for (Preset *preset : project_presets)
+        delete preset;
+
+    REQUIRE(loaded);
+    REQUIRE(reloaded_model.objects.size() == 1);
+    const ModelVolumePtrs &volumes = reloaded_model.objects.front()->volumes;
+    const auto modifier = std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return v->is_modifier(); });
+    REQUIRE(modifier != volumes.end());
+    REQUIRE((*modifier)->config.has("wall_loops_transition"));
+    CHECK((*modifier)->config.opt_serialize("wall_loops_transition") == "ramp");
+    CHECK_THAT((*modifier)->config.opt_float("wall_ramp_taper_ratio"), Catch::Matchers::WithinAbs(7.5, 1e-9));
+    CHECK((*modifier)->config.opt_int("wall_loops") == 4);
+}
+
 SCENARIO("Mirrored instance transforms survive 3mf round trips", "[3mf][Regression]") {
     const bool bbs_format = GENERATE(false, true);
 

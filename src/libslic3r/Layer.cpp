@@ -166,7 +166,7 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
 
         return config.outer_wall_filament_id       == other_config.outer_wall_filament_id
 		&& config.inner_wall_filament_id       == other_config.inner_wall_filament_id
-		&& config.wall_loops                  == other_config.wall_loops
+		&& (config.wall_loops == other_config.wall_loops || is_wall_ramp(config, other_config) || is_wall_ramp(other_config, config))
 		&& config.wall_sequence               == other_config.wall_sequence
 		&& config.is_infill_first             == other_config.is_infill_first
 		&& config.inner_wall_speed.get_at(print.get_extruder_id(config.outer_wall_filament_id)) == other_config.inner_wall_speed.get_at(print.get_extruder_id(config.outer_wall_filament_id))
@@ -202,6 +202,14 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
         && config.seam_slope_min_length   == other_config.seam_slope_min_length
         && config.seam_slope_steps        == other_config.seam_slope_steps
         && config.seam_slope_inner_walls  == other_config.seam_slope_inner_walls;
+}
+
+// Orca: A Ramp region needs more wall loops than the region it tapers into, and a taper ratio above 0; otherwise it
+// keeps the hard step.
+bool Layer::is_wall_ramp(const PrintRegionConfig& ramp, const PrintRegionConfig& part)
+{
+    return ramp.wall_loops_transition == WallLoopsTransition::Ramp && ramp.wall_ramp_taper_ratio.value > 0.
+        && ramp.wall_loops.value > part.wall_loops.value;
 }
 
 // Orca: The parts of `slices` over the void wide enough to be bridged. Narrower ones, as the overhang a sloped wall
@@ -461,6 +469,12 @@ void Layer::make_perimeters()
 	                    if (layerm->region().config().sparse_infill_density > layerm_config->region().config().sparse_infill_density)
 	                    	layerm_config = layerm;
 	                }
+	                // Orca: A Ramp region merged with its part takes the part's walls, unless the group has no Hard region.
+	                if (layerm_config->region().config().wall_loops_transition == WallLoopsTransition::Ramp)
+	                    if (auto hard = std::find_if(layerms.begin(), layerms.end(), [](const LayerRegion *l) {
+	                            return l->region().config().wall_loops_transition == WallLoopsTransition::Hard; });
+	                        hard != layerms.end())
+	                        layerm_config = *hard;
 	                for (const ExPolygon &expoly : clipped)
 	                    slices.begin()->second.emplace_back(slices.begin()->second.front(), expoly);
 	                // merge the surfaces assigned to each group

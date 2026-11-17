@@ -256,6 +256,59 @@ SCENARIO("Config ini load/save interface", "[Config]") {
     }
 }
 
+TEST_CASE("The wall count transition defaults to a hard step with a taper ratio of 10", "[Config]")
+{
+    const PrintRegionConfig &defaults = PrintRegionConfig::defaults();
+    CHECK(defaults.wall_loops_transition.value == WallLoopsTransition::Hard);
+    CHECK_THAT(defaults.wall_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
+    CHECK(DynamicPrintConfig::full_print_config().opt_serialize("wall_loops_transition") == "hard");
+}
+
+TEST_CASE("The wall count transition survives an INI and a JSON round trip", "[Config]")
+{
+    DynamicPrintConfig config;
+    config.set_deserialize_strict({
+        { "wall_loops_transition", "ramp" },
+        { "wall_ramp_taper_ratio", 7.5 },
+    });
+    const bool json = GENERATE(false, true);
+    CAPTURE(json);
+    DynamicPrintConfig loaded;
+    if (! json) {
+        ScopedTemporaryFile tmp(".ini");
+        config.save(tmp.string());
+        loaded.load_from_ini(tmp.string(), ForwardCompatibilitySubstitutionRule::Disable);
+    } else {
+        ScopedTemporaryFile tmp(".json");
+        config.save_to_json(tmp.string(), "test_preset", "User", "1.0.0.0");
+        ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+        std::map<std::string, std::string> key_values;
+        std::string reason;
+        REQUIRE(loaded.load_from_json(tmp.string(), substitutions, true, key_values, reason) == 0);
+        CHECK(reason.empty());
+    }
+    REQUIRE(loaded.has("wall_loops_transition"));
+    CHECK(loaded.opt_enum<WallLoopsTransition>("wall_loops_transition") == WallLoopsTransition::Ramp);
+    CHECK_THAT(loaded.opt_float("wall_ramp_taper_ratio"), Catch::Matchers::WithinAbs(7.5, 1e-9));
+}
+
+TEST_CASE("A config saved without the wall count transition loads as a hard step", "[Config]")
+{
+    ScopedTemporaryFile tmp(".ini");
+    {
+        boost::nowide::ofstream ofs(tmp.string());
+        ofs << "wall_loops = 3\n";
+    }
+    DynamicPrintConfig loaded = DynamicPrintConfig::full_print_config();
+    const ConfigSubstitutions substitutions = loaded.load_from_ini(tmp.string(), ForwardCompatibilitySubstitutionRule::Disable);
+    CHECK(substitutions.empty());
+    PrintRegionConfig region;
+    region.apply(loaded, true);
+    CHECK(region.wall_loops.value == 3);
+    CHECK(region.wall_loops_transition.value == WallLoopsTransition::Hard);
+    CHECK_THAT(region.wall_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
+}
+
 TEST_CASE("Flush-volume warning predicate respects used filament transitions", "[Config][Regression]")
 {
     const std::vector<double> multipliers = {1.0};
