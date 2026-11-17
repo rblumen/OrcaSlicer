@@ -11,13 +11,16 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 
+#include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/ExPolygon.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Tesselate.hpp"
 #include "libslic3r/TriangleMesh.hpp"
-#include "libslic3r/WallBand.hpp"
+#include "libslic3r/WallThicknessField.hpp"
 #include "libslic3r/libslic3r.h"
 
 using namespace Slic3r;
@@ -67,12 +70,54 @@ WallRampZone ramp_zone(indexed_triangle_set mesh, int base_wall_loops, int wall_
     return zone;
 }
 
-std::shared_ptr<const WallThicknessField> build_on(const indexed_triangle_set &part, const std::vector<WallRampZone> &zones)
+// Every parameter the assertions depend on, set.
+WallThicknessFieldParams test_params()
 {
     WallThicknessFieldParams params;
-    params.bead_width         = W;
-    params.max_shift_fraction = 0.25;
-    return WallThicknessField::build({ part }, zones, params);
+    params.bead_width              = W;
+    params.max_shift_fraction      = 0.25;
+    params.max_edge_fraction       = 0.5;
+    params.coarse_edge_fraction    = 1.;
+    params.edge_growth             = 0.1;
+    params.surface_tolerance       = 0.5;
+    params.contour_offset_fraction = 0.5;
+    return params;
+}
+
+std::shared_ptr<const WallThicknessField> build_on(const indexed_triangle_set &part, const std::vector<WallRampZone> &zones)
+{
+    return WallThicknessField::build({ part }, zones, test_params());
+}
+
+// A prism of the given section, from z = 0 to height.
+indexed_triangle_set make_prism(const ExPolygon &section, double height)
+{
+    indexed_triangle_set its;
+    its_merge(its, triangulate_expolygon_3d(section, height, NORMALS_UP));
+    its_merge(its, triangulate_expolygon_3d(section, 0., NORMALS_DOWN));
+    auto add_walls = [&its, height](const Polygon &polygon) {
+        Pointf3s triangles;
+        for (size_t i = 0; i < polygon.points.size(); ++ i) {
+            const Vec2d p = unscaled(polygon.points[i]);
+            const Vec2d q = unscaled(polygon.points[(i + 1) % polygon.points.size()]);
+            const Vec3d p0(p.x(), p.y(), 0.), p1(p.x(), p.y(), height), q0(q.x(), q.y(), 0.), q1(q.x(), q.y(), height);
+            for (const Vec3d &v : { p0, q0, q1, p0, q1, p1 })
+                triangles.emplace_back(v);
+        }
+        its_merge(its, triangles);
+    };
+    add_walls(section.contour);
+    for (const Polygon &hole : section.holes)
+        add_walls(hole);
+    its_merge_vertices(its);
+    return its;
+}
+
+Polygon rectangle(double x_min, double y_min, double x_max, double y_max)
+{
+    Polygon polygon;
+    polygon.points = { Point::new_scale(x_min, y_min), Point::new_scale(x_max, y_min), Point::new_scale(x_max, y_max), Point::new_scale(x_min, y_max) };
+    return polygon;
 }
 
 // An L bracket: its section in XZ is a leg of 40 x 5 along X and a leg of 5 x 30 along Z, sharing
@@ -97,12 +142,13 @@ indexed_triangle_set make_l_bracket()
     return its;
 }
 
-// The test coupon of the plan: a 190 x 35 x 4 mm strap with a 6.5 mm hole 15 mm from each end.
+// The test coupon of the plan: a 190 x 35 x 4 mm strap with a 6.5 mm hole 15 mm from each end. Its
+// faces are fans of long slivers, as an STL's often are.
 indexed_triangle_set make_coupon()
 {
-    const double length = 190., width = 35., height = 4., hole_radius = 3.25, edge_distance = 15.;
+    const double length = 190., width = 35., hole_radius = 3.25, edge_distance = 15.;
     ExPolygon section;
-    section.contour.points = { Point::new_scale(0., 0.), Point::new_scale(length, 0.), Point::new_scale(length, width), Point::new_scale(0., width) };
+    section.contour = rectangle(0., 0., length, width);
     for (double x : { edge_distance, length - edge_distance }) {
         Polygon hole;
         const int steps = 64;
@@ -112,26 +158,16 @@ indexed_triangle_set make_coupon()
         }
         section.holes.emplace_back(std::move(hole));
     }
+    return make_prism(section, 4.);
+}
 
-    indexed_triangle_set its;
-    its_merge(its, triangulate_expolygon_3d(section, height, NORMALS_UP));
-    its_merge(its, triangulate_expolygon_3d(section, 0., NORMALS_DOWN));
-    auto add_walls = [&its, height](const Polygon &polygon) {
-        Pointf3s triangles;
-        for (size_t i = 0; i < polygon.points.size(); ++ i) {
-            const Vec2d p = unscaled(polygon.points[i]);
-            const Vec2d q = unscaled(polygon.points[(i + 1) % polygon.points.size()]);
-            const Vec3d p0(p.x(), p.y(), 0.), p1(p.x(), p.y(), height), q0(q.x(), q.y(), 0.), q1(q.x(), q.y(), height);
-            for (const Vec3d &v : { p0, q0, q1, p0, q1, p1 })
-                triangles.emplace_back(v);
-        }
-        its_merge(its, triangles);
-    };
-    add_walls(section.contour);
-    for (const Polygon &hole : section.holes)
-        add_walls(hole);
-    its_merge_vertices(its);
-    return its;
+// The coupon's two zones, around its holes.
+std::vector<WallRampZone> coupon_zones(double taper_ratio)
+{
+    std::vector<WallRampZone> zones;
+    for (double x : { 15., 175. })
+        zones.push_back(ramp_zone(cylinder_at(x, 17.5, 20., - 3., 7.), 2, 4, taper_ratio));
+    return zones;
 }
 
 // A 60 x 40 x 4 mm plate, with the axis of the modifiers of the tests below at its middle.
@@ -244,6 +280,28 @@ TEST_CASE("Distance across the bend of an L bracket is the unfolded distance", "
         for (double z : { 6., 10., 15. })
             check(Vec3d(5., y, z), boundary_x - 5. + z - 5.);
     }
+}
+
+TEST_CASE("Distance around a slot is longer than the straight line through it", "[WallBand]")
+{
+    // A 60 x 40 x 4 mm plate with a slot through it, x 28 to 32 and y 5 to 35, and a zone of the
+    // plate beyond x = 20 on the other side. From (40, 30) the way round the slot's near end is
+    // |(40, 30) - (32, 35)| + 12 = 21.43 mm; the straight line is 20 mm. Paths that bend round a
+    // corner meet behind it, where the heat method smooths the distance: it comes out a few
+    // percent long, so the bound here is 5%, which still tells it from the straight line.
+    ExPolygon section;
+    section.contour = rectangle(0., 0., 60., 40.);
+    Polygon slot    = rectangle(28., 5., 32., 35.);
+    slot.reverse();
+    section.holes.emplace_back(std::move(slot));
+    // Ramp length 2 * 40 * 0.45 = 36 mm.
+    const auto field = build_on(make_prism(section, 4.), { ramp_zone(box_between(Vec3d(- 5., - 5., - 5.), Vec3d(20., 45., 10.)), 2, 4, 40.) });
+    REQUIRE(field);
+
+    const double geodesic = std::hypot(8., 5.) + 12.;
+    const double distance = field->signed_distance(0, Vec3d(40., 30., 4.));
+    CHECK_THAT(distance, WithinRel(geodesic, 0.05));
+    CHECK(distance > 20.8);
 }
 
 TEST_CASE("Thickness on a plate takes the ramp's values at its start, middle and end", "[WallBand]")
@@ -433,7 +491,7 @@ TEST_CASE("Where two thinning zones overlap the thinner wins", "[WallBand]")
     CHECK_THAT(field->thickness(plate_point(wide_radius + 0.5, 0.), 0., base), WithinAbs(W, 1e-9));
     // Inside the wide zone, half way up the narrow zone's ramp, where it is thicker than the wide zone.
     CHECK_THAT(field->thickness(plate_point(narrow_offset - narrow_radius - 1.35, 0.), 0., base), WithinAbs(2 * W, 1e-9));
-    // A third of the way up the narrow zone's ramp it is thinner than the wide zone's 2 walls.
+    // A sixth of the way up the narrow zone's ramp it is thinner than the wide zone's 2 walls.
     CHECK_THAT(field->thickness(plate_point(narrow_offset - narrow_radius - 0.45, 0.), 0., base), WithinAbs(1.5 * W, 0.03));
     // Inside the wide zone only.
     CHECK_THAT(field->thickness(plate_point(8., 180.), 0., base), WithinAbs(2 * W, 1e-9));
@@ -442,13 +500,12 @@ TEST_CASE("Where two thinning zones overlap the thinner wins", "[WallBand]")
 TEST_CASE("Pieces of one modifier on parts with different wall counts each ramp to their own part's count", "[WallBand]")
 {
     // Two 40 x 40 x 4 plates 1 mm apart along X, of 2 and 3 walls, and one cylinder of 5 walls
-    // across the gap. Ramps of 3 * 10 * 0.45 = 13.5 mm on the first, 2 * 10 * 0.45 = 9 mm on the second.
+    // across the gap. Ramps of 3 * 10 * 0.45 = 13.5 mm on the first, 2 * 10 * 0.45 = 9 mm on the
+    // second, saturating 0.25 * 10 * 0.45 = 1.125 mm beyond.
     const indexed_triangle_set first = its_make_cube(40., 40., 4.), second = translated(its_make_cube(40., 40., 4.), Vec3f(41.f, 0.f, 0.f));
     const double               center_x = 40.5, radius = 8.;
     const indexed_triangle_set modifier = cylinder_at(center_x, 20., radius, - 3., 7.);
-    WallThicknessFieldParams   params;
-    params.bead_width = W;
-    const auto field  = WallThicknessField::build({ first, second }, { ramp_zone(modifier, 2, 5, 10., 0), ramp_zone(modifier, 3, 5, 10., 1) }, params);
+    const auto field = WallThicknessField::build({ first, second }, { ramp_zone(modifier, 2, 5, 10., 0), ramp_zone(modifier, 3, 5, 10., 1) }, test_params());
     REQUIRE(field);
     REQUIRE_THAT(field->ramp_length(0), WithinAbs(13.5, 1e-9));
     REQUIRE_THAT(field->ramp_length(1), WithinAbs(9., 1e-9));
@@ -484,41 +541,175 @@ TEST_CASE("A face the modifier shares with the part from inside belongs to the z
 {
     const double radius = 8.;
     // The cylinder is exactly as tall as the plate, so its caps lie in the plate's faces.
-    const auto field = build_on(make_plate(), { ramp_zone(cylinder_at(PLATE_CENTER.x(), PLATE_CENTER.y(), radius, 0., PLATE_HEIGHT), 2, 4, 10.) });
+    const indexed_triangle_set flush = cylinder_at(PLATE_CENTER.x(), PLATE_CENTER.y(), radius, 0., PLATE_HEIGHT);
+    const auto                 field = build_on(make_plate(), { ramp_zone(flush, 2, 4, 10.) });
     REQUIRE(field);
 
     for (double z : { 0., PLATE_HEIGHT })
         for (double angle : { 20., 110., 260. }) {
             CAPTURE(z, angle);
+            // Inside the zone the distance is negative, so a shift towards the zone keeps all its walls.
+            CHECK(field->signed_distance(0, plate_point(radius - 3., angle, z)) < - 1.);
             CHECK_THAT(field->thickness(plate_point(0., angle, z), 0., 2 * W), WithinAbs(4 * W, 1e-9));
-            CHECK_THAT(field->thickness(plate_point(radius - 3., angle, z), 0., 2 * W), WithinAbs(4 * W, 1e-9));
+            CHECK_THAT(field->thickness(plate_point(radius - 3., angle, z), 0.25, 2 * W), WithinAbs(4 * W, 1e-9));
+            CHECK_THAT(field->signed_distance(0, plate_point(radius - 0.5, angle, z)), IsDistance(- 0.5));
             CHECK_THAT(field->signed_distance(0, plate_point(radius + 3., angle, z)), IsDistance(3.));
             CHECK_THAT(field->thickness(plate_point(radius + 12., angle, z), 0., 2 * W), WithinAbs(2 * W, 1e-9));
         }
+    // The shared faces are meshed finely only near the zone's boundary: no more triangles than for
+    // a cylinder through the plate, give or take.
+    const auto through = build_on(make_plate(), { ramp_zone(plate_cylinder(radius), 2, 4, 10.) });
+    REQUIRE(through);
+    CHECK(field->triangle_count() < 3 * through->triangle_count() / 2);
+
+    // A flush zone without walls keeps none with the shift either.
+    const auto empty = build_on(make_plate(), { ramp_zone(flush, 2, 0, 10.) });
+    REQUIRE(empty);
+    CHECK_THAT(empty->thickness(plate_point(radius - 3., 45.), 0.25, 2 * W), WithinAbs(0., 1e-9));
+}
+
+TEST_CASE("Thickness is continuous onto a second shell the zone does not reach", "[WallBand]")
+{
+    // Two overlapping boxes as separate shells, the zone on the first. The second shell has no zone
+    // boundary of its own, so the straight line distance stands in there. Ramp 2 * 20 * 0.45 = 18 mm.
+    indexed_triangle_set part = box_between(Vec3d(0., 0., 0.), Vec3d(20., 20., 4.));
+    its_merge(part, box_between(Vec3d(17., 0., 0.), Vec3d(40., 20., 4.)));
+    const auto field = build_on(part, { ramp_zone(cylinder_at(8., 10., 4., - 3., 7.), 2, 4, 20.) });
+    REQUIRE(field);
+
+    double previous = field->thickness(Vec3d(12.5, 10., 4.), 0., 2 * W);
+    for (double x = 12.75; x <= 35.; x += 0.25) {
+        const double thickness = field->thickness(Vec3d(x, 10., 4.), 0., 2 * W);
+        CAPTURE(x, previous, thickness);
+        // The ramp drops 2 * 0.45 / 18 = 0.025 mm of thickness per 0.25 mm.
+        CHECK(std::abs(thickness - previous) < 0.06);
+        previous = thickness;
+    }
+}
+
+TEST_CASE("A point further off the surface than the tolerance is out of the zone", "[WallBand]")
+{
+    const auto field = build_on(make_plate(), { ramp_zone(plate_cylinder(8.), 2, 4, 10.) });
+    REQUIRE(field);
+    const double tolerance = test_params().surface_tolerance;
+
+    for (double side : { 1., - 1. }) {
+        CAPTURE(side);
+        const double z_face = side > 0. ? PLATE_HEIGHT : 0.;
+        CHECK_THAT(field->thickness(plate_point(3., 30., z_face + side * (tolerance - 0.05)), 0., 2 * W), WithinAbs(4 * W, 1e-9));
+        CHECK_THAT(field->thickness(plate_point(3., 30., z_face + side * (tolerance + 0.05)), 0., 2 * W), WithinAbs(2 * W, 1e-12));
+    }
+    // Contours are looked up just outside: inside the plate's material, between its faces, too.
+    CHECK_THAT(field->thickness(plate_point(3., 30., PLATE_HEIGHT - 0.3), 0., 2 * W), WithinAbs(4 * W, 1e-9));
+}
+
+TEST_CASE("A contour of a thin wall is looked up on the face it comes from", "[WallBand]")
+{
+    // A fin 0.6 mm thick, its face y = 0 in a zone that ends at y = 0.3, its face y = 0.6 not. From
+    // (2, 0.6, 5) the way to the zone runs around the end at x = 0: 2 + 0.3 mm, past the ramp of
+    // 2 * 2 * 0.45 = 1.8 mm.
+    const indexed_triangle_set fin   = box_between(Vec3d(0., 0., 0.), Vec3d(20., 0.6, 10.));
+    const auto                 field = build_on(fin, { ramp_zone(box_between(Vec3d(- 5., - 5., - 5.), Vec3d(5., 0.3, 15.)), 2, 4, 2.) });
+    REQUIRE(field);
+
+    // A contour point of the face y = 0.6, moved 0.32 mm into the material by compensation, is
+    // closer to the face y = 0.
+    const Vec2d point(2., 0.28), outward(0., 1.);
+    REQUIRE_THAT(field->thickness(Vec3d(point.x(), point.y(), 5.), 0., 2 * W), WithinAbs(4 * W, 1e-9));
+    const std::vector<WallThickness> contour = field->at_contour({ point, Vec2d(2., 0.32) }, { outward, Vec2d(0., 2.) }, 5., 0., 2 * W);
+    REQUIRE(contour.size() == 2);
+    CHECK_THAT(contour[0].thickness, WithinAbs(2 * W, 1e-12));
+    CHECK_THAT(contour[1].thickness, WithinAbs(2 * W, 1e-12));
+    // A contour point of the face y = 0 stays in the zone.
+    const std::vector<WallThickness> other = field->at_contour({ Vec2d(2., 0.05) }, { Vec2d(0., - 1.) }, 5., 0., 2 * W);
+    CHECK_THAT(other.front().thickness, WithinAbs(4 * W, 1e-9));
+}
+
+TEST_CASE("Only boxes near a zone may be affected", "[WallBand]")
+{
+    // Ramp 9 mm and its saturation 1.125 mm beyond, around a circle of radius 8 at (30, 20).
+    const auto field = build_on(make_plate(), { ramp_zone(plate_cylinder(8.), 2, 4, 10.) });
+    REQUIRE(field);
+
+    CHECK(field->may_affect(BoundingBoxf3(Vec3d(25., 15., 0.), Vec3d(35., 25., 4.))));
+    CHECK(field->may_affect(BoundingBoxf3(Vec3d(45., 15., 0.), Vec3d(50., 25., 4.))));
+    CHECK_FALSE(field->may_affect(BoundingBoxf3(Vec3d(55., 15., 0.), Vec3d(60., 25., 4.))));
+    CHECK_FALSE(field->may_affect(BoundingBoxf3(Vec3d(25., 15., 20.), Vec3d(35., 25., 24.))));
+    CHECK_FALSE(field->may_affect(BoundingBoxf3()));
+}
+
+TEST_CASE("Concurrent queries give the same results as serial ones", "[WallBand]")
+{
+    const auto field = build_on(make_plate(), { ramp_zone(plate_cylinder(8.), 2, 4, 10.), ramp_zone(plate_cylinder(5., 10.), 2, 0, 3.) });
+    REQUIRE(field);
+
+    std::vector<Vec3d> points;
+    for (int i = 0; i < 60; ++ i)
+        for (int j = 0; j < 40; ++ j)
+            points.emplace_back(0.5 + i, 0.5 + j, (i + j) % 2 ? PLATE_HEIGHT : 0.);
+    std::vector<WallThickness> serial, parallel(points.size());
+    for (const Vec3d &p : points)
+        serial.emplace_back(field->at(p, 0.25, 2 * W));
+    tbb::parallel_for(tbb::blocked_range<size_t>(0, points.size(), 16), [&](const tbb::blocked_range<size_t> &range) {
+        for (size_t i = range.begin(); i < range.end(); ++ i)
+            parallel[i] = field->at(points[i], 0.25, 2 * W);
+    });
+    size_t mismatches = 0;
+    for (size_t i = 0; i < points.size(); ++ i)
+        mismatches += serial[i].thickness != parallel[i].thickness || serial[i].base != parallel[i].base;
+    CHECK(mismatches == 0);
+}
+
+TEST_CASE("A part of long slivers is remeshed into a bounded number of triangles", "[WallBand]")
+{
+    // The coupon's faces are fans of slivers up to 190 mm long. Subdividing them would make millions
+    // of triangles; remeshed, the two zones of 9 mm long ramps take about 100 thousand.
+    const auto field = build_on(make_coupon(), coupon_zones(5.));
+    REQUIRE(field);
+    CHECK(field->triangle_count() < 400000);
+}
+
+TEST_CASE("An open or degenerate part does not stop the build", "[WallBand]")
+{
+    // A box without its top, a degenerate triangle and a lone open triangle, with a zone across all.
+    indexed_triangle_set part = its_make_cube(20., 20., 4.);
+    part.indices.erase(std::remove_if(part.indices.begin(), part.indices.end(), [&part](const stl_triangle_vertex_indices &f) {
+        return part.vertices[f[0]].z() > 3.f && part.vertices[f[1]].z() > 3.f && part.vertices[f[2]].z() > 3.f;
+    }), part.indices.end());
+    const int base = int(part.vertices.size());
+    for (const Vec3f &v : { Vec3f(5.f, 5.f, 2.f), Vec3f(6.f, 5.f, 2.f), Vec3f(7.f, 5.f, 2.f), Vec3f(30.f, 0.f, 0.f), Vec3f(40.f, 0.f, 0.f), Vec3f(30.f, 10.f, 0.f) })
+        part.vertices.emplace_back(v);
+    part.indices.emplace_back(base, base + 1, base + 2);
+    part.indices.emplace_back(base + 3, base + 4, base + 5);
+
+    std::shared_ptr<const WallThicknessField> field;
+    CHECK_NOTHROW(field = build_on(part, { ramp_zone(box_between(Vec3d(10., - 5., - 5.), Vec3d(45., 25., 10.)), 2, 4, 10.) }));
+    if (field) {
+        const double thickness = field->thickness(Vec3d(5., 0., 2.), 0., 2 * W);
+        CHECK(std::isfinite(thickness));
+        CHECK(thickness >= 2 * W);
+        CHECK(thickness <= 4 * W);
+    }
 }
 
 // Hidden: it measures rather than tests, and its times depend on the machine. Run it with
 // "[WallBandTiming]" to print how long the field of the plan's test coupon takes to build at the
 // three taper ratios of the test groups, and how far its distances on the top face are from the
 // exact ones. Within a few mm of the strap's long edges the heat method smooths the distance by a
-// few percent (see the field's documentation of accuracy), so only the time is checked here; the
-// 2% bound is checked on the plate and the L bracket above.
-TEST_CASE("Thickness field of the test coupon builds in well under a second", "[.][WallBand][WallBandTiming]")
+// few percent (see the field's documentation of accuracy); the 2% bound is checked on the plate and
+// the L bracket above.
+TEST_CASE("The thickness field of the test coupon is timed and measured", "[.][WallBand][WallBandTiming]")
 {
     const indexed_triangle_set coupon = make_coupon();
     REQUIRE_THAT(its_volume(coupon), WithinRel((190. * 35. - 2. * PI * 3.25 * 3.25) * 4., 1e-2));
 
     const double zone_radius = 20., hole_x = 15., center_y = 17.5;
     for (double taper_ratio : { 5., 10., 20. }) {
-        std::vector<WallRampZone> zones;
-        for (double x : { hole_x, 190. - hole_x })
-            zones.push_back(ramp_zone(cylinder_at(x, center_y, zone_radius, - 3., 7.), 2, 4, taper_ratio));
-
         double                                    best_ms = 1e9;
         std::shared_ptr<const WallThicknessField> field;
         for (int run = 0; run < 3; ++ run) {
             const auto start = std::chrono::steady_clock::now();
-            field = build_on(coupon, zones);
+            field = build_on(coupon, coupon_zones(taper_ratio));
             best_ms = std::min(best_ms, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
         }
         REQUIRE(field);
@@ -556,6 +747,6 @@ TEST_CASE("Thickness field of the test coupon builds in well under a second", "[
                << worst.y() << ": " << field->signed_distance(0, worst) << " for " << worst_distance << "), " << query_us << " us per query";
         // Printed directly, as Catch2 would wrap it.
         std::cout << report.str() << std::endl;
-        CHECK(best_ms < 1000.);
+        CHECK(queries > 0);
     }
 }

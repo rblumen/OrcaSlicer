@@ -1,4 +1,4 @@
-#include "WallBand.hpp"
+#include "WallThicknessField.hpp"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +18,7 @@
 #include <tbb/parallel_for.h>
 
 #include "AABBTreeIndirect.hpp"
+#include "BoundingBox.hpp"
 #include "KDTreeIndirect.hpp"
 #include "Point.hpp"
 #include "Triangulation.hpp"
@@ -34,8 +35,12 @@ double wall_ramp_thickness(double distance, int base_wall_loops, int zone_wall_l
 
 namespace {
 
-// A surface point closer than this to a modifier's surface lies on it.
+// The smallest magnitude of the level at a vertex, in mm: a vertex is never on the zone's boundary
+// itself, which keeps the sources of the distance on the cut along the boundary.
 constexpr double ON_SURFACE_TOLERANCE = 1e-4;
+// A modifier triangle whose corners and middle all lie this close (mm) to the part's surface, and
+// parallel to it, is a face the two share.
+constexpr double SHARED_FACE_TOLERANCE = 1e-3;
 // A surface point belongs to a zone if the material this far beneath it is inside the modifier.
 // That decides the faces a modifier shares with the part: a modifier flush with the part from
 // inside reinforces the face, one resting on the part from outside does not.
@@ -46,15 +51,16 @@ constexpr double DIRECT_INSIDE_TEST = 10. * INSIDE_PROBE_DEPTH;
 // A zone boundary crossing an edge closer than this fraction of its length to one of its ends is
 // moved to that end, which keeps slivers out of the mesh.
 constexpr double SNAP_FRACTION = 0.1;
-// Contours are compensated in XY after slicing, so a query point may lie this many bead widths
-// off the surface.
-constexpr double LOOKUP_TOLERANCE_BEADS = 1.;
 // Time step of the heat flow, as a multiple of the square of the coarsest edge length the solved
-// band is meshed with.
+// band is meshed with. Measured on the plate, the L bracket, a slot and the coupon: 0.5 shortens
+// distances around a corner slightly but lengthens them next to a narrow side; 0.25 fails the 2%
+// bound on the plate and the bracket.
 constexpr double HEAT_TIME_FACTOR = 1.;
-// Neighboring triangles this close to coplanar (cosine of the angle of their normals) belong to
-// one facet, which is triangulated afresh.
-constexpr double FACET_PLANAR_COS = 1. - 1e-8;
+// A facet, which is triangulated afresh, gathers neighboring triangles this close to parallel to
+// its first triangle (cosine of the angle of their normals) whose corners all lie this close (mm)
+// to its plane.
+constexpr double FACET_PLANAR_COS      = 1. - 1e-6;
+constexpr double FACET_PLANE_TOLERANCE = 1e-4;
 // A triangle smaller than this, as twice its area over the square of its longest edge, lies in no
 // plane and is dropped.
 constexpr double FACET_MIN_AREA = 1e-9;
@@ -78,31 +84,43 @@ struct TreeMesh
         return this->distance(p, face, closest);
     }
 
-    // Whether p is enclosed by the mesh: the winding number along a ray is not zero. Counting
-    // signed crossings keeps overlapping shells inside, and not only a mesh turned inside out.
+    // Whether p is enclosed by the mesh, which has to be closed and consistently oriented: the
+    // winding number along a ray is not zero for at least two of three rays. Counting signed
+    // crossings keeps overlapping shells inside, and the vote outweighs a ray that grazes a face or
+    // passes through an edge.
     bool contains(const Vec3d &p) const
     {
-        // Skewed, so that a ray from a vertex of an axis aligned part does not graze the faces
-        // or pass through the edges of an axis aligned modifier.
-        static const Vec3d           dir = Vec3d(0.4217, 0.5713, 0.7041).normalized();
+        // Skewed, so that a ray from a vertex of an axis aligned part does not graze the faces or
+        // pass through the edges of an axis aligned modifier.
+        static const std::array<Vec3d, 3> directions { Vec3d(0.4217, 0.5713, 0.7041).normalized(), Vec3d(- 0.6302, 0.2459, 0.7364).normalized(),
+                                                       Vec3d(0.1873, - 0.7139, - 0.6747).normalized() };
         std::vector<igl::Hit<float>> hits;
-        AABBTreeIndirect::intersect_ray_all_hits(its.vertices, its.indices, tree, p, dir, hits);
-        int   winding   = 0;
-        int   last_side = 0;
-        float last_t    = 0.f;
-        for (const igl::Hit<float> &hit : hits) {
-            const stl_triangle_vertex_indices &face = its.indices[hit.id];
-            const Vec3d a      = its.vertices[face[0]].cast<double>();
-            const Vec3d normal = (its.vertices[face[1]].cast<double>() - a).cross(its.vertices[face[2]].cast<double>() - a);
-            const int   side   = normal.dot(dir) > 0. ? 1 : -1;
-            // A ray through an edge reports both its triangles.
-            if (side == last_side && hit.t - last_t <= 1e-6f * (1.f + hit.t))
-                continue;
-            winding  += side;
-            last_side = side;
-            last_t    = hit.t;
+        int                          votes = 0;
+        for (size_t ray = 0; ray < directions.size(); ++ ray) {
+            // Two rays that agree settle the vote.
+            if (ray == 2 && votes != 1)
+                break;
+            const Vec3d &dir = directions[ray];
+            hits.clear();
+            AABBTreeIndirect::intersect_ray_all_hits(its.vertices, its.indices, tree, p, dir, hits);
+            int   winding   = 0;
+            int   last_side = 0;
+            float last_t    = 0.f;
+            for (const igl::Hit<float> &hit : hits) {
+                const stl_triangle_vertex_indices &face = its.indices[hit.id];
+                const Vec3d a      = its.vertices[face[0]].cast<double>();
+                const Vec3d normal = (its.vertices[face[1]].cast<double>() - a).cross(its.vertices[face[2]].cast<double>() - a);
+                const int   side   = normal.dot(dir) > 0. ? 1 : -1;
+                // A ray through an edge reports both its triangles.
+                if (side == last_side && hit.t - last_t <= 1e-6f * (1.f + hit.t))
+                    continue;
+                winding  += side;
+                last_side = side;
+                last_t    = hit.t;
+            }
+            votes += winding != 0;
         }
-        return winding != 0;
+        return votes >= 2;
     }
 };
 
@@ -121,7 +139,7 @@ struct ZoneField
 
     TreeMesh           surface;
     std::vector<float> distance;
-    // Everything outside is further than outside_limit from the zone.
+    // Everything outside is further than outside_limit from the zone, or off its part's surface.
     Eigen::AlignedBox3d reach;
     // A point further than this from the zone's part is not on it, and out of the zone's reach.
     double lookup_tolerance { 0. };
@@ -214,7 +232,10 @@ void remesh_graded(std::vector<Vec3d> &vertices, std::vector<Vec3i32> &faces, co
     const std::vector<int> opposite  = opposite_half_edges(faces);
     const size_t           num_faces = faces.size();
 
-    // Facets: coplanar neighbors joined. A degenerate face lies in no plane and is dropped.
+    // Facets: grown from a seed triangle over its neighbors while every corner of a neighbor lies
+    // within FACET_PLANE_TOLERANCE of the seed's plane, so that a finely tessellated curved surface
+    // does not merge into one facet through a chain of nearly coplanar neighbors. A degenerate face
+    // lies in no plane and is dropped.
     std::vector<Vec3d> normals(num_faces);
     std::vector<char>  degenerate(num_faces, 0);
     for (size_t f = 0; f < num_faces; ++ f) {
@@ -224,22 +245,38 @@ void remesh_graded(std::vector<Vec3d> &vertices, std::vector<Vec3i32> &faces, co
         degenerate[f] = ! (normal.norm() > FACET_MIN_AREA * longest_sqr);
         normals[f]    = degenerate[f] ? Vec3d::Zero() : Vec3d(normal.normalized());
     }
-    std::vector<int> facet(num_faces);
-    std::iota(facet.begin(), facet.end(), 0);
-    auto find = [&facet](int f) {
-        while (facet[f] != f)
-            f = facet[f] = facet[facet[f]];
-        return f;
-    };
-    for (size_t he = 0; he < opposite.size(); ++ he) {
-        const int f = int(he / 3), g = opposite[he] >= 0 ? opposite[he] / 3 : -1;
-        if (g >= 0 && ! degenerate[f] && ! degenerate[g] && normals[f].dot(normals[g]) >= FACET_PLANAR_COS)
-            facet[find(f)] = find(g);
+    // Read only once built, also by the threads below.
+    std::vector<int> facet_of(num_faces, -1);
+    {
+        std::vector<int> queue;
+        for (size_t seed = 0; seed < num_faces; ++ seed) {
+            if (degenerate[seed] || facet_of[seed] != -1)
+                continue;
+            const Vec3d &normal = normals[seed];
+            const double offset = normal.dot(vertices[faces[seed][0]]);
+            facet_of[seed]      = int(seed);
+            queue.assign(1, int(seed));
+            while (! queue.empty()) {
+                const int f = queue.back();
+                queue.pop_back();
+                for (int i = 0; i < 3; ++ i) {
+                    const int o = opposite[f * 3 + i];
+                    if (o < 0)
+                        continue;
+                    const int g = o / 3;
+                    if (degenerate[g] || facet_of[g] != -1 || normals[g].dot(normal) < FACET_PLANAR_COS)
+                        continue;
+                    bool in_plane = true;
+                    for (int k = 0; k < 3; ++ k)
+                        in_plane &= std::abs(normal.dot(vertices[faces[g][k]]) - offset) <= FACET_PLANE_TOLERANCE;
+                    if (in_plane) {
+                        facet_of[g] = int(seed);
+                        queue.emplace_back(g);
+                    }
+                }
+            }
+        }
     }
-    // Read only from here on, also by the threads below.
-    std::vector<int> facet_of(num_faces);
-    for (size_t f = 0; f < num_faces; ++ f)
-        facet_of[f] = find(int(f));
     auto on_boundary = [&](int he) {
         const int o = opposite[he];
         return o < 0 || degenerate[o / 3] || facet_of[o / 3] != facet_of[he / 3];
@@ -251,7 +288,8 @@ void remesh_graded(std::vector<Vec3d> &vertices, std::vector<Vec3i32> &faces, co
     std::function<void(int, int, std::vector<int> &)> resample = [&](int a, int b, std::vector<int> &out) {
         const double length = (vertices[b] - vertices[a]).norm();
         const Vec3d  middle = 0.5 * (vertices[a] + vertices[b]);
-        if (length <= min_size_near(middle, 0.5 * length)) {
+        // Written so that a length or size that is not a number ends the recursion too.
+        if (! (length > min_size_near(middle, 0.5 * length))) {
             out.emplace_back(b);
             return;
         }
@@ -301,6 +339,24 @@ void remesh_graded(std::vector<Vec3d> &vertices, std::vector<Vec3i32> &faces, co
         for (size_t facet_idx = range.begin(); facet_idx < range.end(); ++ facet_idx) {
             const std::vector<int> &members = facet_members[facet_idx];
             FacetMesh              &out     = facet_meshes[facet_idx];
+            auto keep_original = [&]() {
+                out.new_points.clear();
+                out.triangles.clear();
+                for (int f : members)
+                    out.triangles.emplace_back(faces[f]);
+            };
+            // A lone triangle no larger than asked, as a finely tessellated surface is made of,
+            // stays as it is: its edges were not resampled, and nothing would go inside.
+            if (members.size() == 1) {
+                bool small = true;
+                for (int i = 0; i < 3; ++ i)
+                    if (on_boundary(members.front() * 3 + i))
+                        small &= outline_edges.at(edge_key(faces[members.front()][i], faces[members.front()][(i + 1) % 3])).size() == 2;
+                if (small) {
+                    keep_original();
+                    continue;
+                }
+            }
             // A frame of the facet's plane.
             const Vec3d origin = vertices[faces[members.front()][0]];
             const Vec3d normal = normals[members.front()];
@@ -335,30 +391,42 @@ void remesh_graded(std::vector<Vec3d> &vertices, std::vector<Vec3i32> &faces, co
                         }
                     }
             const size_t num_outline = global.size();
-            if (constraints.empty())
+            if (constraints.empty()) {
+                keep_original();
                 continue;
+            }
 
             // Inside: a quadtree over the facet, split while a cell is larger than the size near it,
             // with a point at the middle of each leaf inside the facet and clear of the outline.
             std::vector<std::array<Vec2d, 3>> triangles;
+            std::vector<std::array<bool, 3>>  outline_sides;
             std::vector<Eigen::AlignedBox2d>  triangle_boxes;
             Eigen::AlignedBox2d               box;
             for (int f : members) {
                 std::array<Vec2d, 3> t;
+                std::array<bool, 3>  on_outline;
                 Eigen::AlignedBox2d  triangle_box;
                 for (int i = 0; i < 3; ++ i) {
-                    t[i] = to_plane(vertices[faces[f][i]]);
+                    t[i]          = to_plane(vertices[faces[f][i]]);
+                    on_outline[i] = on_boundary(f * 3 + i);
                     triangle_box.extend(t[i]);
                 }
                 box.extend(triangle_box);
                 triangles.emplace_back(t);
+                outline_sides.emplace_back(on_outline);
                 triangle_boxes.emplace_back(triangle_box);
             }
-            auto inside = [&triangles](const Vec2d &p, const std::vector<int> &candidates) {
+            // On an edge between two of the facet's triangles counts as inside, on its outline not.
+            auto inside = [&](const Vec2d &p, const std::vector<int> &candidates) {
                 for (int idx : candidates) {
-                    const std::array<Vec2d, 3> &t = triangles[idx];
-                    auto side = [&p](const Vec2d &a, const Vec2d &b) { return (b - a).x() * (p - a).y() - (b - a).y() * (p - a).x(); };
-                    if (side(t[0], t[1]) > 0. && side(t[1], t[2]) > 0. && side(t[2], t[0]) > 0.)
+                    const std::array<Vec2d, 3> &t      = triangles[idx];
+                    bool                        within = true;
+                    for (int i = 0; i < 3 && within; ++ i) {
+                        const Vec2d &a = t[i], &b = t[(i + 1) % 3];
+                        const double side = (b - a).x() * (p - a).y() - (b - a).y() * (p - a).x();
+                        within = side > 0. || (side == 0. && ! outline_sides[idx][i]);
+                    }
+                    if (within)
                         return true;
                 }
                 return false;
@@ -398,8 +466,25 @@ void remesh_graded(std::vector<Vec3d> &vertices, std::vector<Vec3i32> &faces, co
                 fill(box.center(), 0.5 * size, all);
             }
 
+            // The triangulation only asserts its preconditions. Two points that round to one would
+            // be merged into one vertex and break the triangles' indices, so they are checked here,
+            // as are the indices that come back; the facet keeps its own triangles if either fails.
+            Points sorted = points;
+            std::sort(sorted.begin(), sorted.end(), [](const Point &a, const Point &b) { return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y()); });
+            if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+                keep_original();
+                continue;
+            }
             std::sort(constraints.begin(), constraints.end());
-            for (const Vec3i32 &t : Triangulation::triangulate(points, constraints))
+            const Triangulation::Indices triangulated = Triangulation::triangulate(points, constraints);
+            const bool valid = ! triangulated.empty() && std::all_of(triangulated.begin(), triangulated.end(), [&points](const Vec3i32 &t) {
+                return t.minCoeff() >= 0 && size_t(t.maxCoeff()) < points.size();
+            });
+            if (! valid) {
+                keep_original();
+                continue;
+            }
+            for (const Vec3i32 &t : triangulated)
                 out.triangles.emplace_back(global[t[0]], global[t[1]], global[t[2]]);
         }
     });
@@ -523,6 +608,11 @@ private:
 // The sources are the vertices of a curve, so both steps hold them fixed, the heat at 1 and the
 // distance at 0. The distance is then exactly zero on the zone's boundary, and the Poisson problem
 // is positive definite without the extra constraint the free-floating formulation needs.
+//
+// libigl's heat_geodesics, which can also use the intrinsic Delaunay triangulation, is not used:
+// it fixes the distance only up to a constant, shifting it so that the sources average zero rather
+// than holding each at zero, and it needs an edge-manifold mesh, which a part's surface cut out
+// around a zone, with overlapping shells or open edges, need not be.
 //
 // Vertices not connected to a source get infinity. Returns an empty vector if a factorization fails.
 std::vector<double> heat_distances(const std::vector<Vec3d> &vertices, const std::vector<Vec3i32> &mesh_faces, const std::vector<char> &is_source,
@@ -760,7 +850,7 @@ void build_zone(ZoneField &zone, const indexed_triangle_set &part, const indexed
     const double bead_width  = params.bead_width;
     const double fine_edge   = params.max_edge_fraction * bead_width;
     const double coarse_edge = std::max(fine_edge, params.coarse_edge_fraction * bead_width);
-    const double tolerance   = LOOKUP_TOLERANCE_BEADS * bead_width;
+    const double tolerance   = std::max(0., params.surface_tolerance);
     // The distance is solved this far past the limits it saturates at, which keeps what the
     // open edge of the solved band does to the solution out of the range that is read.
     const double margin      = tolerance + 2. * coarse_edge;
@@ -805,31 +895,68 @@ void build_zone(ZoneField &zone, const indexed_triangle_set &part, const indexed
     if (faces.empty())
         return;
 
+    // The zone's boundary is where the part's surface passes through the modifier's, or where a face
+    // the two share ends. It lies on the modifier's triangles that do not lie on the part's surface,
+    // so the distance to those bounds the distance to the boundary from below, also across a shared
+    // face, where the distance to the whole modifier is zero.
+    TreeMesh boundary_surface;
+    {
+        TreeMesh part_surface;
+        for (const Vec3d &v : vertices)
+            part_surface.its.vertices.emplace_back(v.cast<float>());
+        for (const Vec3i32 &f : faces)
+            part_surface.its.indices.emplace_back(f);
+        part_surface.build_tree();
+        for (const stl_triangle_vertex_indices &face : modifier.its.indices) {
+            const Vec3d a = modifier.its.vertices[face[0]].cast<double>(), b = modifier.its.vertices[face[1]].cast<double>(),
+                        c = modifier.its.vertices[face[2]].cast<double>();
+            const Vec3d normal = (b - a).cross(c - a);
+            bool on_part = normal.norm() > 0.;
+            for (const Vec3d &corner : { a, b, c, Vec3d((a + b + c) / 3.) }) {
+                if (! on_part)
+                    break;
+                size_t part_face;
+                Vec3d  closest;
+                if (part_surface.distance(corner, part_face, closest) > SHARED_FACE_TOLERANCE) {
+                    on_part = false;
+                    break;
+                }
+                const stl_triangle_vertex_indices &pf = part_surface.its.indices[part_face];
+                const Vec3d pa = part_surface.its.vertices[pf[0]].cast<double>();
+                const Vec3d part_normal = (part_surface.its.vertices[pf[1]].cast<double>() - pa).cross(part_surface.its.vertices[pf[2]].cast<double>() - pa);
+                on_part = std::abs(part_normal.normalized().dot(normal.normalized())) >= FACET_PLANAR_COS;
+            }
+            if (! on_part) {
+                const int first = int(boundary_surface.its.vertices.size());
+                for (int i = 0; i < 3; ++ i)
+                    boundary_surface.its.vertices.emplace_back(modifier.its.vertices[face[i]]);
+                boundary_surface.its.indices.emplace_back(first, first + 1, first + 2);
+            }
+        }
+        boundary_surface.build_tree();
+    }
+    const double infinite_distance = std::numeric_limits<double>::infinity();
+    auto distance_to_boundary = [&](const Vec3d &p) { return boundary_surface.tree.empty() ? infinite_distance : boundary_surface.distance(p); };
+
     // Remesh: edges of fine_edge at the boundary, growing with the distance from it by edge_growth
-    // up to coarse_edge while the distance is solved, and coarsening fast beyond. The distance to
-    // the modifier's surface stands in for the distance to the boundary, which lies on that surface:
-    // it is never larger, so the mesh is at least as fine as asked. Inside the zone the distance is
-    // needed only to inside_limit, so the mesh coarsens from there.
+    // up to coarse_edge while the distance is solved, and coarsening fast beyond. Inside the zone
+    // the distance is needed only to inside_limit, so the mesh coarsens from there.
     auto size_at_distance = [&](double distance, bool inside) {
         const double limit  = (inside ? zone.inside_limit : zone.outside_limit) + margin;
         const double graded = std::min(coarse_edge, fine_edge + params.edge_growth * std::min(distance, limit));
         return distance <= limit ? graded : graded + distance - limit;
     };
     remesh_graded(vertices, faces, [&](const Vec3d &p, double radius) {
-        const double distance = std::max(0., modifier.distance(p) - radius);
-        // A ball clear of the modifier's surface lies wholly inside or wholly outside it, which
-        // matters only where it is far enough inside.
+        const double distance = std::max(0., distance_to_boundary(p) - radius);
+        // A ball clear of the boundary lies wholly inside or wholly outside the zone, which matters
+        // only where it is far enough inside.
         const bool inside = distance > zone.inside_limit + margin && modifier_box.contains(p) && modifier.contains(p);
         return size_at_distance(distance, inside);
     });
-    std::vector<double> surface_distance(vertices.size());
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, vertices.size()), [&](const tbb::blocked_range<size_t> &range) {
-        for (size_t v = range.begin(); v < range.end(); ++ v)
-            surface_distance[v] = modifier.distance(vertices[v]);
-    });
 
-    // Level at the vertices: the distance to the modifier's surface, negative where the material
-    // beneath the surface is inside the modifier, zero on the modifier's surface there.
+    // Level at the vertices: the distance to the boundary surface, negative where the material
+    // beneath the surface is inside the modifier. It is never zero at a vertex, so that the zone's
+    // boundary, and with it the sources of the distance, come only from where the level crosses zero.
     std::vector<Vec3d> normals(vertices.size(), Vec3d::Zero());
     for (const Vec3i32 &face : faces) {
         const Vec3d normal = (vertices[face[1]] - vertices[face[0]]).cross(vertices[face[2]] - vertices[face[0]]);
@@ -839,18 +966,17 @@ void build_zone(ZoneField &zone, const indexed_triangle_set &part, const indexed
     std::vector<double> level(vertices.size());
     tbb::parallel_for(tbb::blocked_range<size_t>(0, vertices.size()), [&](const tbb::blocked_range<size_t> &range) {
         for (size_t v = range.begin(); v < range.end(); ++ v) {
-            const double distance = surface_distance[v];
-            const double length   = normals[v].norm();
+            const double length = normals[v].norm();
             // Away from the modifier's surface the point itself is as good as the probe beneath it.
-            const Vec3d  probe    = distance > DIRECT_INSIDE_TEST || ! (length > 0.) ? vertices[v] :
-                                                                                       Vec3d(vertices[v] - (INSIDE_PROBE_DEPTH / length) * normals[v]);
-            const bool   inside   = modifier_box.contains(probe) && modifier.contains(probe);
-            level[v] = distance < ON_SURFACE_TOLERANCE ? (inside ? 0. : ON_SURFACE_TOLERANCE) : inside ? - distance : distance;
+            const Vec3d  probe  = modifier.distance(vertices[v]) > DIRECT_INSIDE_TEST || ! (length > 0.) ?
+                                      vertices[v] : Vec3d(vertices[v] - (INSIDE_PROBE_DEPTH / length) * normals[v]);
+            const bool   inside = modifier_box.contains(probe) && modifier.contains(probe);
+            const double distance = std::max(ON_SURFACE_TOLERANCE, std::min(distance_to_boundary(vertices[v]), zone.outside_limit + 2. * margin));
+            level[v] = inside ? - distance : distance;
         }
     });
-    normals          = {};
-    surface_distance = {};
-    if (std::none_of(level.begin(), level.end(), [](double l) { return l <= 0.; }))
+    normals = {};
+    if (std::none_of(level.begin(), level.end(), [](double l) { return l < 0.; }))
         // The modifier does not reach the surface.
         return;
 
@@ -932,8 +1058,9 @@ void build_zone(ZoneField &zone, const indexed_triangle_set &part, const indexed
         double       d     = 0.;
         if (level[v] != 0.) {
             // The straight line distance bounds the geodesic one from below. It stands in for it
-            // if the solver failed, and catches what the heat flow does not resolve far away.
-            d = heat_failed ? lower_bound[v] : std::max(solved[v], lower_bound[v]);
+            // where the solve did not reach, on a shell or a piece of the band with no boundary of
+            // its own, or failed, and catches what the heat flow does not resolve far away.
+            d = heat_failed || ! std::isfinite(solved[v]) ? lower_bound[v] : std::max(solved[v], lower_bound[v]);
             d = level[v] < 0. ? - std::min(d, limit) : std::min(d, limit);
         }
         zone.distance[v]             = float(d);
@@ -1017,6 +1144,30 @@ WallThickness WallThicknessField::at(const Vec3d &p, double shift_fraction, doub
     if (thinner.thickness < std::numeric_limits<double>::infinity())
         return thinner;
     return { default_base, default_base };
+}
+
+std::vector<WallThickness> WallThicknessField::at_contour(const std::vector<Vec2d> &points, const std::vector<Vec2d> &outward_normals, double slice_z,
+                                                          double shift_fraction, double default_base) const
+{
+    const double               offset = m_impl->params.contour_offset_fraction * m_impl->params.bead_width;
+    std::vector<WallThickness> out;
+    out.reserve(points.size());
+    for (size_t i = 0; i < points.size(); ++ i) {
+        Vec2d point = points[i];
+        if (i < outward_normals.size())
+            if (const double length = outward_normals[i].norm(); length > 0.)
+                point += (offset / length) * outward_normals[i];
+        out.emplace_back(this->at(Vec3d(point.x(), point.y(), slice_z), shift_fraction, default_base));
+    }
+    return out;
+}
+
+bool WallThicknessField::may_affect(const BoundingBoxf3 &box) const
+{
+    if (! box.defined)
+        return false;
+    const Eigen::AlignedBox3d query(box.min, box.max);
+    return std::any_of(m_impl->zones.begin(), m_impl->zones.end(), [&query](const ZoneField &zone) { return zone.active && zone.reach.intersects(query); });
 }
 
 double WallThicknessField::min_thickness() const
