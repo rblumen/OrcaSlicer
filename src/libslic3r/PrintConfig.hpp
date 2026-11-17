@@ -259,6 +259,13 @@ enum class WallDirection
     Count,
 };
 
+// Orca: How the wall count changes at the boundary of a modifier.
+enum class WallLoopsTransition
+{
+    Hard,
+    Ramp,
+};
+
 // IMEX: physical bed corner where tool T0 sits. Determines how tool indices
 // map to bed zones (front = lower Y near operator, rear = higher Y).
 enum class ImexToolLayout {
@@ -836,6 +843,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ArcFittingMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SurfaceFillOrder)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AdaptiveInfillMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AdaptiveInfillGradient)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WallLoopsTransition)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1621,6 +1629,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                is_infill_first))
     ((ConfigOptionBool,                small_area_infill_flow_compensation))
     ((ConfigOptionEnum<WallDirection>,  wall_direction))
+    ((ConfigOptionEnum<WallLoopsTransition>, wall_loops_transition))
+    ((ConfigOptionFloat,                wall_ramp_taper_ratio))
 
     // Orca: other flow ratios (available for overriding, if set_other_flow_ratios is enabled)
     ((ConfigOptionFloat,                first_layer_flow_ratio))

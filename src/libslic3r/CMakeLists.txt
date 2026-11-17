@@ -567,6 +567,8 @@ set(lisbslic3r_sources
     Utils.hpp
     VariableWidth.cpp
     VariableWidth.hpp
+    WallBandShape.cpp
+    WallBandShape.hpp
     WallThicknessField.cpp
     WallThicknessField.hpp
     Zipper.cpp

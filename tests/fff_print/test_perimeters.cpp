@@ -24,6 +24,11 @@
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Polyline.hpp"
+#include "libslic3r/Config.hpp"
+#include "libslic3r/PrintBase.hpp"
+#include "libslic3r/TriangleSelector.hpp"
+#include <functional>
+#include <initializer_list>
 #include <limits>
 #include <string>
 #include <utility>
@@ -1565,4 +1570,535 @@ TEST_CASE("Changing the brim updates the wall order of the first layer", "[Perim
     // The change does turn the first layer around.
     REQUIRE(before != fresh);
     CHECK(after == fresh);
+}
+
+namespace {
+
+// A layer inside the 2mm tall part, away from its top and bottom shells.
+const double ramp_layer_z = 1.0;
+
+// A 20x20x2 part, and a 10x30 modifier over its +X side whose outline crosses the part along x = 15, so the modifier
+// covers the strip x = 15..20 of the part and the rest of it sticks out of the part.
+Print &part_with_wall_modifier(Print &print, Model &model, const DynamicPrintConfig &config, const DynamicPrintConfig &modifier_config)
+{
+    Test::init_print({ make_cube(20., 20., 2.) }, print, model, config, nullptr, false);
+    TriangleMesh modifier = make_cube(10., 30., 4.);
+    modifier.translate(15.f, -5.f, -1.f);
+    model.objects.front()->add_volume(std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, false)->config.apply(modifier_config);
+    print.apply(model, config);
+    print.process();
+    return print;
+}
+
+// Every setting the wall positions below depend on, so none of them rests on a default.
+DynamicPrintConfig wall_ramp_config(const char *wall_generator, int part_wall_loops = 2)
+{
+    DynamicPrintConfig config = base_config(wall_generator);
+    config.set_deserialize_strict({
+        { "wall_loops",            part_wall_loops },
+        { "nozzle_diameter",       "0.4" },
+        { "line_width",            0.45 },
+        { "outer_wall_line_width", 0.45 },
+        { "inner_wall_line_width", 0.45 },
+        { "outer_wall_speed",      "60" },
+        { "sparse_infill_density", "15%" },
+        { "wall_ramp_taper_ratio", 10. },
+    });
+    return config;
+}
+
+DynamicPrintConfig wall_modifier_config(std::initializer_list<ConfigBase::SetDeserializeItem> items)
+{
+    DynamicPrintConfig config;
+    config.set_deserialize_strict({ { "wall_loops", 4 } });
+    config.set_deserialize_strict(items);
+    return config;
+}
+
+const Layer *layer_at(const Print &print, double print_z)
+{
+    for (const Layer *layer : print.objects().front()->layers())
+        if (std::abs(layer->print_z - print_z) < EPSILON)
+            return layer;
+    return nullptr;
+}
+
+// Wall length the layer extrudes within 1.5mm of the modifier's outline at x = outline_x, away from the outline of the
+// object. Only walls closing the modifier's region, or the part's region around it, run there.
+double buried_wall_length(const Layer &layer, double outline_x = 15.)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const BoundingBox strip(Point(part.min.x() + scaled<coord_t>(outline_x - 1.5), part.min.y() + scaled<coord_t>(3.)),
+                            Point(part.min.x() + scaled<coord_t>(outline_x + 1.5), part.max.y() - scaled<coord_t>(3.)));
+    Polylines walls;
+    for (const LayerRegion *region : layer.regions())
+        append(walls, region->perimeters.as_polylines());
+    return unscaled<double>(total_length(intersection_pl(walls, strip.polygon())));
+}
+
+size_t regions_with_walls(const Layer &layer)
+{
+    return (size_t)std::count_if(layer.regions().begin(), layer.regions().end(), [](const LayerRegion *region) { return ! region->perimeters.empty(); });
+}
+
+// A box modifier over x = x0..x1 and z = z0..z1, spanning y = -5..25 so it sticks out of the parts in Y.
+struct ModifierBox
+{
+    double             x0, x1;
+    double             z0, z1;
+    DynamicPrintConfig config;
+};
+
+// Touching 20x20x2 parts side by side from x = 0, the i-th at x = 20i..20i+20 with part_wall_loops[i] walls (-1 keeps
+// the process value), and the modifiers in the order given. `edit` may change the object before it is sliced.
+Print &slice_parts_with_modifiers(Print &print, Model &model, const DynamicPrintConfig &config, const std::vector<int> &part_wall_loops,
+                                  const std::vector<ModifierBox> &modifiers, const std::function<void(ModelObject&)> &edit = {})
+{
+    Test::init_print({ make_cube(20., 20., 2.) }, print, model, config, nullptr, false);
+    ModelObject *object = model.objects.front();
+    for (size_t i = 0; i < part_wall_loops.size(); ++ i) {
+        ModelVolume *part = object->volumes.front();
+        if (i > 0) {
+            TriangleMesh mesh = make_cube(20., 20., 2.);
+            mesh.translate(float(20. * double(i)), 0.f, 0.f);
+            part = object->add_volume(std::move(mesh), ModelVolumeType::MODEL_PART, false);
+        }
+        if (part_wall_loops[i] >= 0)
+            part->config.set("wall_loops", part_wall_loops[i]);
+    }
+    for (const ModifierBox &box : modifiers) {
+        TriangleMesh mesh = make_cube(box.x1 - box.x0, 30., box.z1 - box.z0);
+        mesh.translate(float(box.x0), -5.f, float(box.z0));
+        object->add_volume(std::move(mesh), ModelVolumeType::PARAMETER_MODIFIER, false)->config.apply(box.config);
+    }
+    if (edit)
+        edit(*object);
+    print.apply(model, config);
+    print.process();
+    return print;
+}
+
+// A modifier over the whole height of the parts.
+ModifierBox modifier_box(double x0, double x1, const DynamicPrintConfig &config) { return { x0, x1, -1., 3., config }; }
+
+// The base wall counts the regions of modifiers with a ramped transition are keyed to, in increasing order.
+std::vector<int> wall_ramp_base_loops(const Print &print)
+{
+    const PrintObject &object = *print.objects().front();
+    std::vector<int> out;
+    for (size_t i = 0; i < object.num_printing_regions(); ++ i)
+        if (const int base = object.printing_region(i).wall_ramp_base_loops(); base >= 0)
+            out.emplace_back(base);
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+std::string perimeter_warnings(const Print &print)
+{
+    std::string text;
+    for (const auto &warning : print.objects().front()->step_state_with_warnings(posPerimeters).warnings)
+        text += warning.message;
+    return text;
+}
+
+} // namespace
+
+// Hard gives the modifier closed walls of its own, so walls run inside the part along the modifier's outline. The Ramp
+// transition merges the modifier's region with the part's, which walls the outline of the part only.
+TEST_CASE("A modifier with more walls and a ramped transition shares the part's walls instead of walling its outline inside the part", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print hard_print, ramp_print;
+    Model hard_model, ramp_model;
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator), wall_modifier_config({}));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator), wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    const Layer *hard = layer_at(hard_print, ramp_layer_z);
+    const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
+    REQUIRE(hard != nullptr);
+    REQUIRE(ramp != nullptr);
+
+    // At least one wall of each region along the 14mm of the strip.
+    CHECK(buried_wall_length(*hard) > 2. * 14.);
+    CHECK(regions_with_walls(*hard) == 2);
+    CHECK_THAT(buried_wall_length(*ramp), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(regions_with_walls(*ramp) == 1);
+    CHECK(perimeter_warnings(ramp_print).empty());
+}
+
+// The taper ratio only acts with the Ramp transition, so a modifier on Hard slices as one that sets neither key.
+TEST_CASE("A modifier on the Hard transition slices as one without the wall count transition settings", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print unset_print, hard_print;
+    Model unset_model, hard_model;
+    part_with_wall_modifier(unset_print, unset_model, wall_ramp_config(wall_generator), wall_modifier_config({}));
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator),
+                            wall_modifier_config({ { "wall_loops_transition", "hard" }, { "wall_ramp_taper_ratio", 5. } }));
+    const SliceLengths unset = slice_lengths(unset_print);
+    const SliceLengths hard  = slice_lengths(hard_print);
+    REQUIRE(unset.perimeters.size() == hard.perimeters.size());
+    CHECK_THAT(max_difference(unset.perimeters, hard.perimeters), Catch::Matchers::WithinAbs(0., 1.));
+    CHECK_THAT(max_difference(unset.fills,      hard.fills),      Catch::Matchers::WithinAbs(0., 1.));
+    CHECK(perimeter_warnings(hard_print).empty());
+}
+
+// A modifier thinning the walls merges with the part like one thickening them. Until the ramp is built, the merged
+// walls are the part's.
+TEST_CASE("A modifier with fewer walls and a ramped transition shares the part's walls instead of walling its outline inside the part", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print hard_print, ramp_print;
+    Model hard_model, ramp_model;
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator, 4), wall_modifier_config({ { "wall_loops", 2 } }));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator, 4),
+                            wall_modifier_config({ { "wall_loops", 2 }, { "wall_loops_transition", "ramp" } }));
+    const Layer *hard = layer_at(hard_print, ramp_layer_z);
+    const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
+    REQUIRE(hard != nullptr);
+    REQUIRE(ramp != nullptr);
+
+    // At least one wall of each region along the 14mm of the strip.
+    CHECK(buried_wall_length(*hard) > 2. * 14.);
+    CHECK(regions_with_walls(*hard) == 2);
+    CHECK_THAT(buried_wall_length(*ramp), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(regions_with_walls(*ramp) == 1);
+    CHECK(perimeter_warnings(ramp_print).empty());
+}
+
+// A modifier may thin the walls down to none. It merges with the part like any other, without a warning.
+TEST_CASE("A modifier without walls and with a ramped transition shares the part's walls", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print hard_print, ramp_print;
+    Model hard_model, ramp_model;
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator), wall_modifier_config({ { "wall_loops", 0 } }));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator),
+                            wall_modifier_config({ { "wall_loops", 0 }, { "wall_loops_transition", "ramp" } }));
+    const Layer *hard = layer_at(hard_print, ramp_layer_z);
+    const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
+    REQUIRE(hard != nullptr);
+    REQUIRE(ramp != nullptr);
+
+    // On Hard the part walls its side of the modifier's outline.
+    CHECK(buried_wall_length(*hard) > 14.);
+    CHECK_THAT(buried_wall_length(*ramp), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(regions_with_walls(*ramp) == 1);
+    CHECK(perimeter_warnings(ramp_print).empty());
+}
+
+// The Ramp transition needs a taper ratio above 0, and the part's walls can only be shared when the rest of the wall
+// settings agree. Otherwise the modifier keeps its own walls, with a warning.
+TEST_CASE("A modifier with a ramped transition that cannot share the part's walls keeps the hard step and warns", "[Perimeters][WallRamp]")
+{
+    const std::string case_name = GENERATE("zero taper ratio", "other wall speed");
+    CAPTURE(case_name);
+    DynamicPrintConfig modifier_config = wall_modifier_config({ { "wall_loops_transition", "ramp" } });
+    if (case_name == "zero taper ratio")
+        modifier_config.set_deserialize_strict({ { "wall_ramp_taper_ratio", 0. } });
+    else
+        modifier_config.set_deserialize_strict({ { "outer_wall_speed", "30" } });
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("classic"), modifier_config);
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK(buried_wall_length(*layer) > 2. * 14.);
+    CHECK(regions_with_walls(*layer) == 2);
+    CHECK_FALSE(perimeter_warnings(print).empty());
+}
+
+// Over two parts with different wall counts, a modifier with a ramped transition gets a region per base wall count, and
+// each one shares the walls of its own part.
+TEST_CASE("A modifier with a ramped transition over parts with different wall counts shares the walls of each part", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config(wall_generator), { 2, 3 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" } })) });
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2, 3 });
+    CHECK_THAT(buried_wall_length(*layer, 15.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK_THAT(buried_wall_length(*layer, 25.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(perimeter_warnings(print).empty());
+}
+
+// The base wall count only splits the modifier's regions where the parts differ.
+TEST_CASE("A modifier with a ramped transition over parts with the same wall count keeps one region", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config("classic"), { 2, 2 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" } })) });
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2 });
+    CHECK_THAT(buried_wall_length(*layer, 15.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK_THAT(buried_wall_length(*layer, 25.), Catch::Matchers::WithinAbs(0., 0.5));
+}
+
+// The base wall count follows the part, so the modifier's region keeps merging with it.
+TEST_CASE("Changing the part's wall count re-keys the region of a modifier with a ramped transition", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    const DynamicPrintConfig config = wall_ramp_config("classic");
+    part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    REQUIRE(wall_ramp_base_loops(print) == std::vector<int>{ 2 });
+
+    ModelVolume *part = model.objects.front()->volumes.front();
+    REQUIRE(part->is_model_part());
+    part->config.set("wall_loops", 3);
+    print.apply(model, config);
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 3 });
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    CHECK_FALSE(print.objects().front()->is_step_done(posPerimeters));
+
+    print.process();
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    CHECK_THAT(buried_wall_length(*layer_at(print, ramp_layer_z)), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(regions_with_walls(*layer_at(print, ramp_layer_z)) == 1);
+}
+
+// Switching a modifier to the Ramp transition regenerates the walls from the existing slices.
+TEST_CASE("Switching a modifier to the Ramp transition regenerates its walls without reslicing", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    const DynamicPrintConfig config = wall_ramp_config("classic");
+    part_with_wall_modifier(print, model, config, wall_modifier_config({}));
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    REQUIRE(buried_wall_length(*layer_at(print, ramp_layer_z)) > 2. * 14.);
+
+    ModelVolume *modifier = model.objects.front()->volumes.back();
+    REQUIRE(modifier->is_modifier());
+    modifier->config.apply(wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    print.apply(model, config);
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    CHECK_FALSE(print.objects().front()->is_step_done(posPerimeters));
+
+    print.process();
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    CHECK_THAT(buried_wall_length(*layer_at(print, ramp_layer_z)), Catch::Matchers::WithinAbs(0., 0.5));
+}
+
+// Switching back to Hard drops the key and walls the modifier's outline again, from the existing slices.
+TEST_CASE("Switching a modifier back to the Hard transition walls its outline again without reslicing", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    const DynamicPrintConfig config = wall_ramp_config("classic");
+    part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    REQUIRE_THAT(buried_wall_length(*layer_at(print, ramp_layer_z)), Catch::Matchers::WithinAbs(0., 0.5));
+
+    ModelVolume *modifier = model.objects.front()->volumes.back();
+    REQUIRE(modifier->is_modifier());
+    modifier->config.apply(wall_modifier_config({ { "wall_loops_transition", "hard" } }));
+    print.apply(model, config);
+    CHECK(wall_ramp_base_loops(print).empty());
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    CHECK_FALSE(print.objects().front()->is_step_done(posPerimeters));
+
+    print.process();
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    CHECK(buried_wall_length(*layer_at(print, ramp_layer_z)) > 2. * 14.);
+}
+
+// The taper ratio alone decides between the ramp and the hard step: 0 brings the hard step back.
+TEST_CASE("Changing the taper ratio of a modifier with a ramped transition regenerates its walls without reslicing", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    const DynamicPrintConfig config = wall_ramp_config("classic");
+    part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 10. } }));
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    REQUIRE_THAT(buried_wall_length(*layer_at(print, ramp_layer_z)), Catch::Matchers::WithinAbs(0., 0.5));
+
+    ModelVolume *modifier = model.objects.front()->volumes.back();
+    REQUIRE(modifier->is_modifier());
+    modifier->config.apply(wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 0. } }));
+    print.apply(model, config);
+    CHECK(print.objects().front()->is_step_done(posSlice));
+    CHECK_FALSE(print.objects().front()->is_step_done(posPerimeters));
+
+    print.process();
+    REQUIRE(layer_at(print, ramp_layer_z) != nullptr);
+    CHECK(buried_wall_length(*layer_at(print, ramp_layer_z)) > 2. * 14.);
+    CHECK_FALSE(perimeter_warnings(print).empty());
+}
+
+// The piece of the modifier over the part with 3 walls has as many walls as the part with 2, which it must not join.
+TEST_CASE("A modifier with a ramped transition shares walls only with the part it is keyed to, not with a part of its own wall count", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config("classic"), { 2, 3 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops", 2 }, { "wall_loops_transition", "ramp" } })) });
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2, 3 });
+    CHECK_THAT(buried_wall_length(*layer, 25.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK_THAT(buried_wall_length(*layer, 15.), Catch::Matchers::WithinAbs(0., 0.5));
+}
+
+// The part with 4 walls comes first, and the modifier over the other part has 4 walls too.
+TEST_CASE("A modifier with a ramped transition is not taken by an earlier part of its own wall count", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config("classic"), { 4, 2 },
+                               { modifier_box(25., 35., wall_modifier_config({ { "wall_loops_transition", "ramp" } })) });
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK_THAT(buried_wall_length(*layer, 25.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK_THAT(buried_wall_length(*layer, 35.), Catch::Matchers::WithinAbs(0., 0.5));
+}
+
+// A modifier with 6 walls inside one with 4, both with a ramped transition, on a part with 2: all three share walls.
+TEST_CASE("Nested modifiers with ramped transitions share the part's walls", "[Perimeters][WallRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config(wall_generator), { -1 },
+                               { modifier_box(10., 30., wall_modifier_config({ { "wall_loops_transition", "ramp" } })),
+                                 modifier_box(14., 30., wall_modifier_config({ { "wall_loops", 6 }, { "wall_loops_transition", "ramp" } })) });
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK_THAT(buried_wall_length(*layer, 10.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK_THAT(buried_wall_length(*layer, 14.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(regions_with_walls(*layer) == 1);
+    CHECK(perimeter_warnings(print).empty());
+}
+
+// The transition is the modifier's own setting: one nested inside a modifier with a ramped transition, which does not
+// set it, keeps the hard step.
+TEST_CASE("A modifier nested inside one with a ramped transition does not inherit it", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config("classic"), { -1 },
+                               { modifier_box(10., 30., wall_modifier_config({ { "wall_loops_transition", "ramp" } })),
+                                 modifier_box(14., 30., wall_modifier_config({ { "wall_loops", 6 } })) });
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    // Only the outer modifier is keyed.
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2 });
+    CHECK_THAT(buried_wall_length(*layer, 10.), Catch::Matchers::WithinAbs(0., 0.5));
+    CHECK(buried_wall_length(*layer, 14.) > 2. * 14.);
+}
+
+// The Ramp transition set in the process or on a part is not a modifier's own setting, so it changes nothing.
+TEST_CASE("The Ramp transition set in the process or on a part has no effect", "[Perimeters][WallRamp]")
+{
+    const std::string where = GENERATE("process", "part");
+    CAPTURE(where);
+
+    DynamicPrintConfig ramp_config = wall_ramp_config("classic");
+    if (where == "process")
+        ramp_config.set_deserialize_strict({ { "wall_loops_transition", "ramp" } });
+    Print plain_print, ramp_print;
+    Model plain_model, ramp_model;
+    slice_parts_with_modifiers(plain_print, plain_model, wall_ramp_config("classic"), { -1 }, { modifier_box(15., 25., wall_modifier_config({})) });
+    slice_parts_with_modifiers(ramp_print, ramp_model, ramp_config, { -1 }, { modifier_box(15., 25., wall_modifier_config({})) },
+                               [&where](ModelObject &object) {
+                                   if (where == "part")
+                                       object.volumes.front()->config.set_key_value("wall_loops_transition",
+                                           new ConfigOptionEnum<WallLoopsTransition>(WallLoopsTransition::Ramp));
+                               });
+    CHECK(wall_ramp_base_loops(ramp_print).empty());
+    const SliceLengths plain = slice_lengths(plain_print);
+    const SliceLengths ramp  = slice_lengths(ramp_print);
+    REQUIRE(plain.perimeters.size() == ramp.perimeters.size());
+    CHECK_THAT(max_difference(plain.perimeters, ramp.perimeters), Catch::Matchers::WithinAbs(0., 1.));
+    CHECK_THAT(max_difference(plain.fills,      ramp.fills),      Catch::Matchers::WithinAbs(0., 1.));
+}
+
+// The part supplies the walls of the merged group even where the modifier's denser infill would otherwise pick the
+// modifier's settings, so the walls are those of a modifier with the part's infill.
+TEST_CASE("The part supplies the walls a modifier with a ramped transition and denser infill shares", "[Perimeters][WallRamp]")
+{
+    Print sparse_print, dense_print;
+    Model sparse_model, dense_model;
+    slice_parts_with_modifiers(sparse_print, sparse_model, wall_ramp_config("classic"), { -1 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "sparse_infill_density", "15%" } })) });
+    slice_parts_with_modifiers(dense_print, dense_model, wall_ramp_config("classic"), { -1 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "sparse_infill_density", "50%" } })) });
+    const SliceLengths sparse = slice_lengths(sparse_print);
+    const SliceLengths dense  = slice_lengths(dense_print);
+    REQUIRE(sparse.perimeters.size() == dense.perimeters.size());
+    CHECK_THAT(max_difference(sparse.perimeters, dense.perimeters), Catch::Matchers::WithinAbs(0., 1.));
+}
+
+// Where the modifier covers the whole cross-section of its part, it is walled on its own, and the part beside it with
+// as many walls as the modifier does not take it in: the boundary between the two keeps its walls.
+TEST_CASE("A modifier with a ramped transition covering its part's whole cross-section is walled on its own", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    // Covers the part at x = 0..20 from z = 1 up.
+    slice_parts_with_modifiers(print, model, wall_ramp_config("classic"), { 2, 4 },
+                               { ModifierBox{ -5., 20., 1., 3., wall_modifier_config({ { "wall_loops_transition", "ramp" } }) } });
+    const Layer *covered = layer_at(print, 1.6);
+    REQUIRE(covered != nullptr);
+    CHECK(regions_with_walls(*covered) == 2);
+    CHECK(buried_wall_length(*covered, 20.) > 2. * 14.);
+}
+
+// A height range changing the part's wall count keys the modifier's region per range, and both merge.
+TEST_CASE("A height range with its own wall count keys a modifier with a ramped transition per range", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config("classic"), { -1 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" } })) },
+                               [](ModelObject &object) {
+                                   DynamicPrintConfig range;
+                                   // Every layer range must carry a layer_height (see layer_height_profile_from_ranges).
+                                   range.set_deserialize_strict({ { "wall_loops", 3 }, { "layer_height", 0.2 } });
+                                   object.layer_config_ranges[{ 1., 2. }].assign_config(std::move(range));
+                               });
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2, 3 });
+    for (const double z : { 0.6, 1.6 }) {
+        CAPTURE(z);
+        const Layer *layer = layer_at(print, z);
+        REQUIRE(layer != nullptr);
+        CHECK_THAT(buried_wall_length(*layer), Catch::Matchers::WithinAbs(0., 0.5));
+    }
+}
+
+// Fuzzy skin painting copies the modifier's region, key included, so the copy shares the walls like the original.
+TEST_CASE("A fuzzy skin painted copy of a modifier region with a ramped transition keeps its key", "[Perimeters][WallRamp]")
+{
+    DynamicPrintConfig config = wall_ramp_config("classic");
+    config.set_deserialize_strict({ { "fuzzy_skin", "external" } });
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, config, { -1 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" } })) },
+                               [](ModelObject &object) {
+                                   ModelVolume     &part = *object.volumes.front();
+                                   TriangleSelector selector(part.mesh());
+                                   selector.set_facet(0, EnforcerBlockerType::FUZZY_SKIN);
+                                   part.fuzzy_skin_facets.set(selector);
+                               });
+    // The modifier's region and its fuzzy skin copy.
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2, 2 });
 }
