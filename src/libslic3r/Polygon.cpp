@@ -682,6 +682,49 @@ void remove_collinear(Polygons &polys)
 		remove_collinear(poly);
 }
 
+Points resample_polygon(const Points &contour, double dist, std::vector<ResampledPoint> *resampled_point_parameters)
+{
+    Points out;
+    if (contour.size() <= 2)
+        return out;
+
+    // Each edge ending at a vertex yields ceil(l / dist) points, or the vertex alone if it has zero length.
+    size_t n_out   = 0;
+    Vec2d  pt_prev = contour.back().cast<double>();
+    for (const Point &pt : contour) {
+        n_out  += std::max<size_t>(1, size_t(ceil((pt.cast<double>() - pt_prev).norm() / dist)));
+        pt_prev = pt.cast<double>();
+    }
+    out.reserve(n_out);
+    if (resampled_point_parameters)
+        resampled_point_parameters->reserve(n_out);
+
+    pt_prev = contour.back().cast<double>();
+    for (const Point &pt : contour) {
+        size_t       idx_this = &pt - contour.data();
+        const Vec2d  pt_this  = pt.cast<double>();
+        const Vec2d  v        = pt_this - pt_prev;
+        const double l        = v.norm();
+        const size_t n        = size_t(ceil(l / dist));
+        const double l_step   = l / n;
+        for (size_t i = 1; i < n; ++ i) {
+            double interpolation_parameter = double(i) / n;
+            Vec2d  new_pt                  = pt_prev + v * interpolation_parameter;
+            out.emplace_back(new_pt.cast<coord_t>());
+            if (resampled_point_parameters)
+                resampled_point_parameters->emplace_back(idx_this, true, l_step);
+        }
+        out.emplace_back(pt);
+        if (resampled_point_parameters)
+            resampled_point_parameters->emplace_back(idx_this, false, l_step);
+        pt_prev = pt_this;
+    }
+    if (resampled_point_parameters)
+        for (size_t i = 1; i < resampled_point_parameters->size(); ++ i)
+            (*resampled_point_parameters)[i].curve_parameter += (*resampled_point_parameters)[i - 1].curve_parameter;
+    return out;
+}
+
 Polygons polygons_simplify(const Polygons &source_polygons, double tolerance)
 {
     Polygons out;

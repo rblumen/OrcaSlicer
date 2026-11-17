@@ -24,16 +24,6 @@
 
 namespace Slic3r {
 
-struct ResampledPoint {
-	ResampledPoint(size_t idx_src, bool interpolated, double curve_parameter) : idx_src(idx_src), interpolated(interpolated), curve_parameter(curve_parameter) {}
-
-	size_t		idx_src;
-	// Is this point interpolated or initial?
-	bool 		interpolated;
-	// Euclidean distance along the curve from the 0th point.
-	double		curve_parameter;
-};
-
 // Distance calculated using SDF (Shape Diameter Function).
 // The distance is calculated by casting a fan of rays and measuring the intersection distance.
 // Thus the calculation is relatively slow. For the Elephant foot compensation purpose, this distance metric does not avoid 
@@ -422,36 +412,6 @@ std::vector<float> contour_distance2(const EdgeGrid::Grid &grid, const size_t id
 	return out;
 }
 
-Points resample_polygon(const Points &contour, double dist, std::vector<ResampledPoint> &resampled_point_parameters)
-{
-	Points out;
-	out.reserve(contour.size());
-	resampled_point_parameters.reserve(contour.size());
-    if (contour.size() > 2) {
-    	Vec2d  pt_prev  = contour.back().cast<double>();
-    	for (const Point &pt : contour) {
-			size_t idx_this = &pt - contour.data();
-    		const Vec2d  pt_this = pt.cast<double>();
-    		const Vec2d  v		 = pt_this - pt_prev;
-			const double l		 = v.norm();
-    		const size_t n		 = size_t(ceil(l / dist));
-			const double l_step  = l / n;
-    		for (size_t i = 1; i < n; ++ i) {
-				double interpolation_parameter = double(i) / n;
-    			Vec2d new_pt = pt_prev + v * interpolation_parameter;
-    			out.emplace_back(new_pt.cast<coord_t>());
-				resampled_point_parameters.emplace_back(idx_this, true, l_step);
-			}
-    		out.emplace_back(pt);
-			resampled_point_parameters.emplace_back(idx_this, false, l_step);
-    		pt_prev = pt_this;
-    	}
-		for (size_t i = 1; i < resampled_point_parameters.size(); ++i)
-			resampled_point_parameters[i].curve_parameter += resampled_point_parameters[i - 1].curve_parameter;
-    }
-    return out;
-}
-
 #if 0
 static inline void smooth_compensation(std::vector<float> &compensation, float strength, size_t num_iterations)
 {
@@ -584,7 +544,7 @@ ExPolygon elephant_foot_compensation(const ExPolygon &input_expoly, double min_c
 		for (size_t idx_contour = 0; idx_contour <= simplified.holes.size(); ++ idx_contour) {
 			Polygon &poly = (idx_contour == 0) ? resampled.contour : resampled.holes[idx_contour - 1];
 			std::vector<ResampledPoint> resampled_point_parameters;
-			poly.points = resample_polygon(poly.points, resample_interval, resampled_point_parameters);
+			poly.points = resample_polygon(poly.points, resample_interval, &resampled_point_parameters);
 			assert(poly.is_counter_clockwise() == (idx_contour == 0));
 			std::vector<float> dists = contour_distance2(grid, idx_contour, poly.points, resampled_point_parameters, scaled_compensation, search_radius);
 			for (float &d : dists) {
