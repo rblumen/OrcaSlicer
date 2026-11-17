@@ -822,6 +822,12 @@ void print_region_ref_inc(PrintRegion &r) { ++ r.m_ref_cnt; }
 void print_region_ref_reset(PrintRegion &r) { r.m_ref_cnt = 0; }
 int  print_region_ref_cnt(const PrintRegion &r) { return r.m_ref_cnt; }
 
+// Orca: PrintRegion::wall_ramp_base_loops() of the region of a modifier with the config `config` over `parent`.
+static int wall_ramp_base_loops(const PrintRegionConfig &config, const PrintRegion &parent)
+{
+    return config.wall_loops_transition == WallLoopsTransition::Ramp ? parent.config().wall_loops.value : -1;
+}
+
 // Verify whether the PrintRegions of a PrintObject are still valid, possibly after updating the region configs.
 // Before region configs are updated, callback_invalidate() is called to possibly stop background processing.
 // Returns false if this object needs to be resliced because regions were merged or split.
@@ -886,7 +892,11 @@ bool verify_update_print_object_regions(
                 PrintRegionConfig cfg = region.parent == -1 ?
                     region_config_from_model_volume(default_region_config, layer_range.config, **it_model_volume, num_extruders, variant_index) :
                     region_config_from_model_volume(layer_range.volume_regions[region.parent].region->config(), nullptr, **it_model_volume, num_extruders, variant_index);
-                if (cfg != region.region->config()) {
+                // Orca: A modifier that does not modify its parent shares the parent's region and keeps its key.
+                const PrintRegion *parent = region.parent == -1 ? nullptr : layer_range.volume_regions[region.parent].region;
+                const int base_loops = parent == nullptr || parent == region.region || ! region.model_volume->is_region_modifier() ?
+                    region.region->wall_ramp_base_loops() : wall_ramp_base_loops(cfg, *parent);
+                if (cfg != region.region->config() || base_loops != region.region->wall_ramp_base_loops()) {
                     // Region configuration changed.
                     if (print_region_ref_cnt(*region.region) == 0) {
                         // Region is referenced for the first time. Just change its parameters.
@@ -894,6 +904,7 @@ bool verify_update_print_object_regions(
                         t_config_option_keys diff = region.region->config().diff(cfg);
                         callback_invalidate(region.region->config(), cfg, diff);
                         region.region->config_apply_only(cfg, diff, false);
+                        region.region->set_wall_ramp_base_loops(base_loops);
                     } else {
                         // Region is referenced multiple times, thus the region is being split. We need to reslice.
                         return false;
@@ -914,7 +925,8 @@ bool verify_update_print_object_regions(
             cfg.top_surface_filament_id.value = region.extruder_id;
             cfg.bottom_surface_filament_id.value = region.extruder_id;
             cfg.sparse_infill_filament_id.value       = region.extruder_id;
-            if (cfg != region.region->config()) {
+            const int base_loops = parent_region.region->wall_ramp_base_loops();
+            if (cfg != region.region->config() || base_loops != region.region->wall_ramp_base_loops()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
                     // Region is referenced for the first time. Just change its parameters.
@@ -922,6 +934,7 @@ bool verify_update_print_object_regions(
                     t_config_option_keys diff = region.region->config().diff(cfg);
                     callback_invalidate(region.region->config(), cfg, diff);
                     region.region->config_apply_only(cfg, diff, false);
+                    region.region->set_wall_ramp_base_loops(base_loops);
                 } else {
                     // Region is referenced multiple times, thus the region is being split. We need to reslice.
                     return false;
@@ -936,7 +949,8 @@ bool verify_update_print_object_regions(
             const PrintRegion &parent_print_region = *region.parent_print_object_region(layer_range);
             PrintRegionConfig  cfg                 = parent_print_region.config();
             if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
-            if (cfg != region.region->config()) {
+            const int base_loops = parent_print_region.wall_ramp_base_loops();
+            if (cfg != region.region->config() || base_loops != region.region->wall_ramp_base_loops()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
                     // Region is referenced for the first time. Just change its parameters.
@@ -944,6 +958,7 @@ bool verify_update_print_object_regions(
                     t_config_option_keys diff = region.region->config().diff(cfg);
                     callback_invalidate(region.region->config(), cfg, diff);
                     region.region->config_apply_only(cfg, diff, false);
+                    region.region->set_wall_ramp_base_loops(base_loops);
                 } else {
                     // Region is referenced multiple times, thus the region is being split. We need to reslice.
                     return false;
@@ -971,7 +986,8 @@ bool verify_update_print_object_regions(
                 // carry an invalid (default) gradient_volume_id, so the AND condition is always
                 // true and behavior matches the legacy check.
                 if (regions[i]->config() == regions[j]->config()
-                    && regions[i]->gradient_volume_id() == regions[j]->gradient_volume_id()) {
+                    && regions[i]->gradient_volume_id() == regions[j]->gradient_volume_id()
+                    && regions[i]->wall_ramp_base_loops() == regions[j]->wall_ramp_base_loops()) {
                     // Regions were merged. We need to reslice.
                     return false;
                 }
@@ -1111,16 +1127,19 @@ static PrintObjectRegions* generate_print_object_regions(
     // keys the region to one ModelVolume so two volumes with identical settings still get
     // separate regions — needed so each part can run its own gradient. A default (invalid)
     // tag reproduces the previous lookup exactly.
-    auto get_create_region = [&region_set, &all_regions](PrintRegionConfig &&config, ObjectID volume_tag = ObjectID()) -> PrintRegion* {
+    // Orca: wall_ramp_base_loops keys the region of a modifier with a ramped transition to the wall count of its parent,
+    // see PrintRegion::wall_ramp_base_loops(). The default -1 reproduces the previous lookup exactly.
+    auto get_create_region = [&region_set, &all_regions](PrintRegionConfig &&config, ObjectID volume_tag = ObjectID(), int wall_ramp_base_loops = -1) -> PrintRegion* {
         size_t hash = config.hash();
-        auto it = Slic3r::lower_bound_by_predicate(region_set.begin(), region_set.end(), [&config, hash, volume_tag](const PrintRegion* l) {
+        auto it = Slic3r::lower_bound_by_predicate(region_set.begin(), region_set.end(), [&config, hash, volume_tag, wall_ramp_base_loops](const PrintRegion* l) {
             return l->config_hash() < hash || (l->config_hash() == hash && l->config() < config)
-                || (l->config_hash() == hash && l->config() == config && l->gradient_volume_id() < volume_tag); });
+                || (l->config_hash() == hash && l->config() == config && l->gradient_volume_id() < volume_tag)
+                || (l->config_hash() == hash && l->config() == config && l->gradient_volume_id() == volume_tag && l->wall_ramp_base_loops() < wall_ramp_base_loops); });
         if (it != region_set.end() && (*it)->config_hash() == hash && (*it)->config() == config
-            && (*it)->gradient_volume_id() == volume_tag)
+            && (*it)->gradient_volume_id() == volume_tag && (*it)->wall_ramp_base_loops() == wall_ramp_base_loops)
             return *it;
         // Insert into a sorted array, it has O(n) complexity, but the calling algorithm has an O(n^2*log(n)) complexity anyways.
-        all_regions.emplace_back(std::make_unique<PrintRegion>(std::move(config), hash, int(all_regions.size()), volume_tag));
+        all_regions.emplace_back(std::make_unique<PrintRegion>(std::move(config), hash, int(all_regions.size()), volume_tag, wall_ramp_base_loops));
         PrintRegion *region = all_regions.back().get();
         region_set.emplace(it, region);
         return region;
@@ -1204,7 +1223,8 @@ static PrintObjectRegions* generate_print_object_regions(
                                     if (PrintRegionConfig config = region_config_from_model_volume(parent_region.region->config(), nullptr, volume, num_extruders, variant_index);
                                         config != parent_region.region->config()) {
                                         added = true;
-                                        layer_range.volume_regions.push_back({ &volume, parent_region_id, get_create_region(std::move(config)), bbox });
+                                        const int base_loops = wall_ramp_base_loops(config, *parent_region.region);
+                                        layer_range.volume_regions.push_back({ &volume, parent_region_id, get_create_region(std::move(config), ObjectID(), base_loops), bbox });
                                     } else if (parent_model_part_id == -1 && parent_volume.is_model_part())
                                         parent_model_part_id = parent_region_id;
                                 }
@@ -1231,7 +1251,8 @@ static PrintObjectRegions* generate_print_object_regions(
                     cfg.top_surface_filament_id.value = painted_extruder_id;
                     cfg.bottom_surface_filament_id.value = painted_extruder_id;
                     cfg.sparse_infill_filament_id.value       = painted_extruder_id;
-                    layer_range.painted_regions.push_back({ painted_extruder_id, parent_region_id, get_create_region(std::move(cfg))});
+                    layer_range.painted_regions.push_back({ painted_extruder_id, parent_region_id,
+                        get_create_region(std::move(cfg), ObjectID(), parent_region.region->wall_ramp_base_loops()) });
                 }
         // Sort the regions by parent region::print_object_region_id() and extruder_id to help the slicing algorithm when applying MM segmentation.
         std::sort(layer_range.painted_regions.begin(), layer_range.painted_regions.end(), [&layer_range](auto &l, auto &r) {
@@ -1250,7 +1271,8 @@ static PrintObjectRegions* generate_print_object_regions(
                 if (const PrintObjectRegions::VolumeRegion &parent_volume_region = layer_range.volume_regions[parent_volume_region_id]; parent_volume_region.model_volume->is_model_part() || parent_volume_region.model_volume->is_region_modifier()) {
                     PrintRegionConfig cfg = parent_volume_region.region->config();
                     if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
-                    layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::VolumeRegion, parent_volume_region_id, get_create_region(std::move(cfg))});
+                    layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::VolumeRegion, parent_volume_region_id,
+                        get_create_region(std::move(cfg), ObjectID(), parent_volume_region.region->wall_ramp_base_loops())});
                 }
             }
 
@@ -1259,7 +1281,8 @@ static PrintObjectRegions* generate_print_object_regions(
 
                 PrintRegionConfig cfg = parent_painted_region.region->config();
                 if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
-                layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::PaintedRegion, parent_painted_regions_id, get_create_region(std::move(cfg))});
+                layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::PaintedRegion, parent_painted_regions_id,
+                    get_create_region(std::move(cfg), ObjectID(), parent_painted_region.region->wall_ramp_base_loops())});
             }
 
             // Sort the regions by parent region::print_object_region_id() to help the slicing algorithm when applying fuzzy skin segmentation.

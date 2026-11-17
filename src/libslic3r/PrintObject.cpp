@@ -544,7 +544,8 @@ void PrintObject::make_perimeters()
     m_print->set_status(15, L("Generating walls"));
     BOOST_LOG_TRIVIAL(info) << "Generating walls..." << log_memory_info();
 
-    // Orca: A Ramp modifier its region cannot taper into keeps the hard step at its outline, see Layer::is_wall_ramp().
+    // Orca: A modifier with a ramped transition that cannot share the part's walls keeps the hard step at its outline,
+    // see Layer::is_wall_ramp(). Its region is keyed to the parent's wall count, so only these two cases are left.
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges)
         for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
             if (volume_region.parent < 0 || ! volume_region.model_volume->is_region_modifier())
@@ -553,11 +554,11 @@ void PrintObject::make_perimeters()
             const PrintRegion &parent   = *layer_range.volume_regions[volume_region.parent].region;
             if (modifier.config().wall_loops_transition != WallLoopsTransition::Ramp || modifier.config().wall_loops == parent.config().wall_loops)
                 continue;
-            if (! Layer::is_wall_ramp(modifier.config(), parent.config()) && ! Layer::is_wall_ramp(parent.config(), modifier.config()))
+            if (modifier.config().wall_ramp_taper_ratio.value <= 0.)
                 this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                     // TRN: %1% is the name of a modifier, %2% the name of an object.
-                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs more "
-                                        "wall loops than the part and a taper ratio above 0."),
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs "
+                                        "a taper ratio above 0."),
                                    volume_region.model_volume->name, this->model_object()->name));
             else if (! Layer::is_perimeter_compatible(*m_print, modifier, parent))
                 this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
