@@ -5986,7 +5986,9 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("How the wall count changes at the boundary of a modifier that sets more or fewer walls than the part.\n\n"
                      "Hard: the modifier gets closed walls of its own around its outline, including inside the part.\n"
                      "Ramp: the modifier shares the walls of the part, and the wall count changes gradually from the part's "
-                     "to the modifier's over a ramp set by the taper ratio. The other wall settings of the modifier must match the part's.");
+                     "to the modifier's over a ramp set by the taper ratio. The other wall settings of the modifier must match the part's.\n\n"
+                     "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
+                     "and nested modifiers do not inherit it.");
     def->enum_keys_map = &ConfigOptionEnum<WallLoopsTransition>::get_enum_values();
     def->enum_values.push_back("hard");
     def->enum_values.push_back("ramp");
@@ -6001,7 +6003,7 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Wall ramp taper ratio");
     def->category = L("Strength");
     def->tooltip = L("With the Ramp wall count transition, the length of the ramp per unit of change in wall thickness. "
-                     "For example, 10 changes the wall thickness by 1 mm over 10 mm. Must be greater than 0.");
+                     "For example, 10 changes the wall thickness by 1 mm over 10 mm. 0 keeps the hard step.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10.));

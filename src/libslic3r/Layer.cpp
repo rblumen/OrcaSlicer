@@ -166,7 +166,7 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
 
         return config.outer_wall_filament_id       == other_config.outer_wall_filament_id
 		&& config.inner_wall_filament_id       == other_config.inner_wall_filament_id
-		&& (config.wall_loops == other_config.wall_loops || is_wall_ramp(a, b) || is_wall_ramp(b, a))
+		&& a.wall_group_loops() == b.wall_group_loops() // Orca: the wall_loops of both, unless one has a ramped transition
 		&& config.wall_sequence               == other_config.wall_sequence
 		&& config.is_infill_first             == other_config.is_infill_first
 		&& config.inner_wall_speed.get_at(print.get_extruder_id(config.outer_wall_filament_id)) == other_config.inner_wall_speed.get_at(print.get_extruder_id(config.outer_wall_filament_id))
@@ -202,16 +202,6 @@ bool Layer::is_perimeter_compatible(const Print& print, const PrintRegion& a, co
         && config.seam_slope_min_length   == other_config.seam_slope_min_length
         && config.seam_slope_steps        == other_config.seam_slope_steps
         && config.seam_slope_inner_walls  == other_config.seam_slope_inner_walls;
-}
-
-// Orca: A modifier with a ramped transition tapers its wall count into the part's, up or down, when the two differ and
-// its taper ratio is above 0; otherwise it keeps the hard step. It tapers only into the wall count it was keyed to, so
-// that over two parts with different wall counts each of its regions merges with its own part.
-bool Layer::is_wall_ramp(const PrintRegion& ramp, const PrintRegion& part)
-{
-    const PrintRegionConfig &config = ramp.config();
-    return config.wall_loops_transition == WallLoopsTransition::Ramp && config.wall_ramp_taper_ratio.value > 0.
-        && config.wall_loops.value != part.config().wall_loops.value && ramp.wall_ramp_base_loops() == part.config().wall_loops.value;
 }
 
 // Orca: The parts of `slices` over the void wide enough to be bridged. Narrower ones, as the overhang a sloped wall
@@ -471,13 +461,12 @@ void Layer::make_perimeters()
 	                    if (layerm->region().config().sparse_infill_density > layerm_config->region().config().sparse_infill_density)
 	                    	layerm_config = layerm;
 	                }
-	                // Orca: A modifier with a ramped transition merged with its part takes the part's walls, unless the group
-	                // has no region with a hard step.
-	                if (layerm_config->region().config().wall_loops_transition == WallLoopsTransition::Ramp)
-	                    if (auto hard = std::find_if(layerms.begin(), layerms.end(), [](const LayerRegion *l) {
-	                            return l->region().config().wall_loops_transition == WallLoopsTransition::Hard; });
-	                        hard != layerms.end())
-	                        layerm_config = *hard;
+	                // Orca: A modifier with a ramped transition merged with its part takes the part's walls, so a region
+	                // without a ramp supplies them, unless the modifier covers the whole cross-section.
+	                if (layerm_config->region().has_wall_ramp())
+	                    if (auto part = std::find_if(layerms.begin(), layerms.end(), [](const LayerRegion *l) { return ! l->region().has_wall_ramp(); });
+	                        part != layerms.end())
+	                        layerm_config = *part;
 	                for (const ExPolygon &expoly : clipped)
 	                    slices.begin()->second.emplace_back(slices.begin()->second.front(), expoly);
 	                // merge the surfaces assigned to each group

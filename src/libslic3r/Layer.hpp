@@ -205,8 +205,6 @@ public:
 
     // Whether two regions can be printed in a continues perimeter
     static bool             is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b);
-    // Orca: Whether the wall count of `ramp` changes to that of `part` over the Ramp transition instead of in a hard step.
-    static bool             is_wall_ramp(const PrintRegion& ramp, const PrintRegion& part);
     // Moves a strip of the regions supported next to a bridge of another region to the bridge to anchor on.
     void                    anchor_bridges_in_neighbours();
     void                    make_perimeters();

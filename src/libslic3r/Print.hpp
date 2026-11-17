@@ -139,14 +139,28 @@ enum class SlicingPipelineStepPlugin {
 
 // A PrintRegion object represents a group of volumes to print
 // sharing the same config (including the same assigned extruder(s))
+// Orca: Keys the region of a modifier with a ramped transition to the walls it shares with its part, so that modifier
+// regions with the same config over parents with different wall counts are kept apart.
+struct WallRampKey
+{
+    // Wall count of the region the modifier modifies, which its wall count changes from over the ramp. -1 if none.
+    int base { -1 };
+    // Wall count of the walls it shares: those of the part, through any modifiers with a ramped transition in between.
+    int root { -1 };
+
+    bool operator==(const WallRampKey &rhs) const { return base == rhs.base && root == rhs.root; }
+    bool operator!=(const WallRampKey &rhs) const { return ! (*this == rhs); }
+    bool operator<(const WallRampKey &rhs) const { return base < rhs.base || (base == rhs.base && root < rhs.root); }
+};
+
 class PrintRegion
 {
 public:
     PrintRegion() = default;
     PrintRegion(const PrintRegionConfig &config);
-    PrintRegion(const PrintRegionConfig &config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID()) : m_config(config), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id) {}
+    PrintRegion(const PrintRegionConfig &config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), WallRampKey wall_ramp_key = {}) : m_config(config), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_wall_ramp_key(wall_ramp_key) {}
     PrintRegion(PrintRegionConfig &&config);
-    PrintRegion(PrintRegionConfig &&config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), int wall_ramp_base_loops = -1) : m_config(std::move(config)), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_wall_ramp_base_loops(wall_ramp_base_loops) {}
+    PrintRegion(PrintRegionConfig &&config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), WallRampKey wall_ramp_key = {}) : m_config(std::move(config)), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_wall_ramp_key(wall_ramp_key) {}
     ~PrintRegion() = default;
 
 // Methods NOT modifying the PrintRegion's state:
@@ -160,10 +174,16 @@ public:
     // Default-constructed (invalid) means this region is not tied to a specific volume — preserves
     // existing behavior for all paths not using per_part_gradient.
     ObjectID                    gradient_volume_id() const throw() { return m_gradient_volume_id; }
-    // Orca: For the region of a modifier with a ramped transition, the wall count of the region it modifies, which the
-    // wall count changes from over the ramp. Modifier regions with the same config over parents with different wall
-    // counts are kept apart by it. -1 for any other region.
-    int                         wall_ramp_base_loops() const throw() { return m_wall_ramp_base_loops; }
+    // Orca: Set for the region of a modifier with a ramped transition, default for any other region.
+    const WallRampKey&          wall_ramp_key() const throw() { return m_wall_ramp_key; }
+    // Orca: The wall count this modifier region changes from over the ramp, -1 if it is not one with a ramped transition.
+    int                         wall_ramp_base_loops() const throw() { return m_wall_ramp_key.base; }
+    // Orca: Whether this region shares the walls of its part over a ramp instead of walling its own outline. A taper
+    // ratio of 0 keeps the hard step.
+    bool                        has_wall_ramp() const throw() { return m_wall_ramp_key.base >= 0 && m_config.wall_ramp_taper_ratio.value > 0.; }
+    // Orca: The wall count of the walls this region shares. Regions share walls only when these agree, which for
+    // regions without a ramp is the plain equality of their wall counts.
+    int                         wall_group_loops() const throw() { return this->has_wall_ramp() ? m_wall_ramp_key.root : m_config.wall_loops.value; }
 	// 1-based extruder identifier for this region and role.
 	unsigned int 				extruder(FlowRole role) const;
     Flow                        flow(const PrintObject &object, FlowRole role, double layer_height, bool first_layer = false) const;
@@ -182,7 +202,7 @@ public:
     void                        set_config(PrintRegionConfig &&config) { m_config = std::move(config); m_config_hash = m_config.hash(); }
     void                        config_apply_only(const ConfigBase &other, const t_config_option_keys &keys, bool ignore_nonexistent = false)
                                         { m_config.apply_only(other, keys, ignore_nonexistent); m_config_hash = m_config.hash(); }
-    void                        set_wall_ramp_base_loops(int wall_ramp_base_loops) { m_wall_ramp_base_loops = wall_ramp_base_loops; }
+    void                        set_wall_ramp_key(const WallRampKey &wall_ramp_key) { m_wall_ramp_key = wall_ramp_key; }
 private:
     friend Print;
     friend void print_region_ref_inc(PrintRegion&);
@@ -198,7 +218,7 @@ private:
     // letting same-color volumes within a combined ModelObject be tracked separately for gradient
     // emission. Default invalid -> region keying behaves exactly as before.
     ObjectID           m_gradient_volume_id;
-    int                m_wall_ramp_base_loops { -1 };
+    WallRampKey        m_wall_ramp_key;
 };
 
 inline bool operator==(const PrintRegion &lhs, const PrintRegion &rhs) { return lhs.config_hash() == rhs.config_hash() && lhs.config() == rhs.config(); }
