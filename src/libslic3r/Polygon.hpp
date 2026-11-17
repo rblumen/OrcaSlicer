@@ -166,6 +166,22 @@ inline void polygons_append(Polygons &dst, Polygons &&src)
 
 Polygons polygons_simplify(const Polygons &polys, double tolerance);
 
+// Where a point of resample_polygon() came from.
+struct ResampledPoint {
+    ResampledPoint(size_t idx_src, bool interpolated, double curve_parameter) : idx_src(idx_src), interpolated(interpolated), curve_parameter(curve_parameter) {}
+
+    size_t idx_src;
+    // Is this point interpolated or initial?
+    bool   interpolated;
+    // Euclidean distance along the curve from the 0th point.
+    double curve_parameter;
+};
+
+// Splits every edge of a closed contour into equal pieces no longer than `dist` (scaled). The output
+// starts with the points inserted on the closing edge, before contour.front(), and keeps the original
+// vertices. Optionally reports where each output point came from.
+Points resample_polygon(const Points &contour, double dist, std::vector<ResampledPoint> *resampled_point_parameters = nullptr);
+
 inline void polygons_rotate(Polygons &polys, double angle)
 {
     const double cos_angle = cos(angle);
