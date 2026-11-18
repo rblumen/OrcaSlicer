@@ -31,6 +31,7 @@ class PrintRegion;
 class PrintRegionConfig;
 class PrintObject;
 class Print;
+class WallThicknessField;
 
 namespace FillAdaptive {
     struct RegionOctrees;
@@ -96,7 +97,8 @@ public:
     void    slices_to_fill_surfaces_clipped();
     void    prepare_fill_surfaces();
     //BBS
-    void    make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap);
+    void    make_perimeters(const SurfaceCollection &slices, const LayerRegionPtrs &compatible_regions, SurfaceCollection* fill_surfaces, ExPolygons* fill_no_overlap,
+                            const WallThicknessField *wall_thickness_field = nullptr);
     void    process_external_surfaces(const Layer *lower_layer, const Polygons *lower_layer_covered);
     double  infill_area_threshold() const;
     // Trim surfaces by trimming polygons. Used by the elephant foot compensation at the 1st layer.
@@ -207,7 +209,8 @@ public:
     static bool             is_perimeter_compatible(const Print& print, const PrintRegion& a, const PrintRegion& b);
     // Moves a strip of the regions supported next to a bridge of another region to the bridge to anchor on.
     void                    anchor_bridges_in_neighbours();
-    void                    make_perimeters();
+    // Orca: wall_thickness_field is the object's Ramp wall count transition, see WallBand.hpp.
+    void                    make_perimeters(const WallThicknessField *wall_thickness_field = nullptr);
     // Phony version of make_fills() without parameters for Perl integration only.
     void                    make_fills() { this->make_fills(nullptr); }
     void                    make_fills(const FillAdaptive::RegionOctrees* fill_octrees, FillLightning::Generator* lightning_generator = nullptr);

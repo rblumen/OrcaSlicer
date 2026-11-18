@@ -37,8 +37,10 @@
 // The part and modifier meshes have to be closed and consistently oriented: whether a point is in
 // the zone is decided by winding numbers. A zone narrower than about w/2 may be missed.
 //
-// The field is built once per object and only read afterwards.
+// The field is built once per object and only queried afterwards; the one thing a query writes is the
+// note_skipped() flags.
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <vector>
@@ -105,7 +107,7 @@ struct WallThickness
 // to be the frame of the layer slices, so that a point of a layer's contour, with the layer's
 // slice_z as its Z, lies on a part mesh.
 //
-// Immutable once built: any number of threads may query it concurrently.
+// Immutable once built, apart from the note_skipped() flags: any number of threads may query it concurrently.
 class WallThicknessField
 {
 public:
@@ -154,14 +156,24 @@ public:
     // max(N0, N1) * w. The caller's default applies elsewhere.
     double min_thickness() const;
     double max_thickness() const;
+    // w, the bead width the thicknesses are multiples of, in mm.
+    double bead_width() const;
+    // The smallest taper ratio rho of the active zones, which gives the steepest ramp.
+    double min_taper_ratio() const;
     // Triangles of the remeshed surfaces of all zones, for diagnostics.
     size_t triangle_count() const;
+
+    // Bits of the reasons islands within reach of a zone took the stock walls instead of a band, see WallBandSkip in
+    // WallBand.hpp. The one thing queries may write, so that the layers, generated in parallel, can report it.
+    void     note_skipped(unsigned reasons) const { m_skipped.fetch_or(reasons, std::memory_order_relaxed); }
+    unsigned skipped() const { return m_skipped.load(std::memory_order_relaxed); }
 
 private:
     struct Impl;
     explicit WallThicknessField(std::unique_ptr<const Impl> impl);
 
     std::unique_ptr<const Impl> m_impl;
+    mutable std::atomic<unsigned> m_skipped { 0 };
 };
 
 // t(d) of one zone, see the top of the file. All lengths in mm.

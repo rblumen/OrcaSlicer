@@ -30,6 +30,8 @@
 #include "Tesselate.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "Utils.hpp"
+#include "WallBand.hpp"
+#include "WallThicknessField.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/Fill.hpp"
 #include "Fill/FillLightning.hpp"
@@ -657,18 +659,52 @@ void PrintObject::make_perimeters()
         BOOST_LOG_TRIVIAL(debug) << "Generating extra perimeters for region " << region_id << " in parallel - end";
     }
 
+    // Orca: the walls of modifiers with a ramped transition follow the object's thickness field, see WallBand.hpp.
+    // Only Arachne walls follow it, see LayerRegion::make_perimeters().
+    std::shared_ptr<const WallThicknessField> wall_thickness_field;
+    if (m_config.wall_generator.value == PerimeterGeneratorType::Arachne && ! m_print->config().spiral_mode) {
+        std::vector<const ModelVolume*> inconsistent_modifiers;
+        wall_thickness_field = build_wall_thickness_field(*this, &inconsistent_modifiers);
+        for (const ModelVolume *modifier : inconsistent_modifiers)
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                // TRN: %1% is the name of a modifier, %2% the name of an object.
+                Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard wall count transition: the Ramp transition needs "
+                                    "the same wall settings in every height range."),
+                               modifier->name, this->model_object()->name));
+    }
+    m_print->throw_if_canceled();
+
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),
-        [this](const tbb::blocked_range<size_t>& range) {
+        [this, &wall_thickness_field](const tbb::blocked_range<size_t>& range) {
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                 m_print->throw_if_canceled();
-                m_layers[layer_idx]->make_perimeters();
+                m_layers[layer_idx]->make_perimeters(wall_thickness_field.get());
             }
         }
     );
     m_print->throw_if_canceled();
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - end";
+
+    // Orca: islands in a Ramp zone that took the stock walls, see wall_band_paths().
+    if (wall_thickness_field) {
+        const unsigned skipped = wall_thickness_field->skipped();
+        auto warn = [this](const std::string &text) { this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL, text); };
+        const std::string &name = this->model_object()->name;
+        if (skipped & wbsAlternateExtraWall)
+            // TRN: %1% is the name of an object.
+            warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to some layers of object %1% because Alternate extra wall is enabled."), name));
+        if (skipped & wbsOnlyOneWallFirstLayer)
+            // TRN: %1% is the name of an object.
+            warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to the first layer of object %1% because Only one wall on first layer is enabled."), name));
+        if (skipped & wbsExtraWallsOnOverhangs)
+            // TRN: %1% is the name of an object.
+            warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to some layers of object %1% because Extra perimeters on overhangs is enabled."), name));
+        if (skipped & wbsExtraPerimeters)
+            // TRN: %1% is the name of an object.
+            warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to some layers of object %1% because they have extra walls."), name));
+    }
 
     this->set_done(posPerimeters);
 }

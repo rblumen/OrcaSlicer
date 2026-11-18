@@ -1188,6 +1188,17 @@ double WallThicknessField::max_thickness() const
     return thickness;
 }
 
+double WallThicknessField::bead_width() const { return m_impl->params.bead_width; }
+
+double WallThicknessField::min_taper_ratio() const
+{
+    double ratio = std::numeric_limits<double>::infinity();
+    for (const ZoneField &zone : m_impl->zones)
+        if (zone.active)
+            ratio = std::min(ratio, zone.taper_ratio);
+    return ratio;
+}
+
 size_t WallThicknessField::triangle_count() const
 {
     size_t count = 0;

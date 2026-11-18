@@ -2536,6 +2536,24 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         }
     }
 
+    // Orca: a modifier with the Ramp wall count transition keeps all its walls under top surfaces, so Only one wall on
+    // top surfaces set on the modifier itself contradicts it. A value inherited from the process is overridden quietly.
+    for (const PrintObject *print_object : m_objects)
+        for (const ModelVolume *volume : print_object->model_object()->volumes) {
+            if (! volume->is_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
+                continue;
+            const DynamicPrintConfig &cfg = volume->config.get();
+            const bool ramp = (cfg.has("wall_loops_transition") ? cfg.opt_enum<WallLoopsTransition>("wall_loops_transition") :
+                                                                    m_default_region_config.wall_loops_transition.value) == WallLoopsTransition::Ramp;
+            const int  wall_loops = cfg.has("wall_loops") ? cfg.opt_int("wall_loops") : m_default_region_config.wall_loops.value;
+            if (ramp && wall_loops > 1)
+                // TRN: %1% is the name of a modifier, %2% the name of an object.
+                return { Slic3r::format(_u8L("Modifier %1% of object %2% uses the Ramp wall count transition, which keeps all its walls under top surfaces. "
+                                             "Disable Only one wall on top surfaces on this modifier, or set its transition to Hard."),
+                                        volume->name, print_object->model_object()->name),
+                         print_object->model_object(), "only_one_wall_top" };
+        }
+
     // Cache of layer height profiles for checking:
     // 1) Whether all layers are synchronized if printing with wipe tower and / or unsynchronized supports.
     // 2) Whether layer height is constant for Organic supports.

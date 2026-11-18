@@ -19,6 +19,7 @@
 
 namespace Slic3r { class ExtrusionEntityCollection; }
 namespace Slic3r { class SurfaceCollection; }
+namespace Slic3r { class WallThicknessField; }
 
 namespace Slic3r {
 struct FuzzySkinConfig
@@ -118,6 +119,8 @@ public:
     std::vector<std::pair<FuzzySkinConfig, ExPolygons>> regions_by_fuzzify;
     // Area resting on the layer below, where fuzzy skin is allowed. Unset means no restriction.
     std::optional<ExPolygons>                       fuzzy_supported_area;
+    // Orca: thickness field of the Ramp wall count transition, null unless the object has one. See WallBand.hpp.
+    const WallThicknessField                       *wall_thickness_field = nullptr;
     
     PerimeterGenerator(
         // Input:
