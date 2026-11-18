@@ -27,11 +27,14 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/PrintBase.hpp"
 #include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/Arachne/utils/ExtrusionJunction.hpp"
+#include "libslic3r/Arachne/utils/ExtrusionLine.hpp"
 #include "libslic3r/WallBand.hpp"
 #include <functional>
 #include <initializer_list>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -2106,17 +2109,93 @@ TEST_CASE("A fuzzy skin painted copy of a modifier region with a ramped transiti
 
 namespace {
 
-// Number of walls the layer lays across its y = 0 side at x mm from the part's -X side: the pieces of its walls within
-// a 0.02mm wide strip there, running from 1mm outside the side to 3mm inside it.
-size_t walls_across_side(const Layer &layer, double x)
+// A wall crossing the layer's y = 0 side: how far in from the side, its place in the extrusion order, its inset and
+// whether it is an outer wall.
+struct SideCrossing
+{
+    double           depth;
+    size_t           order;
+    int              inset;
+    bool             external;
+    // The insets of all pieces of the wall there.
+    std::vector<int> insets;
+    // Whether the extrusion starts or ends within the strip, as the pieces of a wall do at a split.
+    bool             ends_here = false;
+};
+
+// The pieces of the layer's walls within a 0.02mm wide strip across its y = 0 side at x mm from the part's -X side,
+// running from 1mm outside the side to 3mm inside it, from the outside in.
+std::vector<SideCrossing> raw_side_crossings(const Layer &layer, double x)
 {
     const BoundingBox part = get_extents(layer.lslices);
     const BoundingBox strip(Point(part.min.x() + scaled<coord_t>(x - 0.01), part.min.y() - scaled<coord_t>(1.)),
                             Point(part.min.x() + scaled<coord_t>(x + 0.01), part.min.y() + scaled<coord_t>(3.)));
-    Polylines walls;
+    std::vector<SideCrossing> crossings;
+    size_t                    order = 0;
     for (const LayerRegion *region : layer.regions())
-        append(walls, region->perimeters.as_polylines());
-    return intersection_pl(walls, strip.polygon()).size();
+        for (const ExtrusionEntity *entity : region->perimeters.flatten().entities) {
+            const Polylines whole     = entity->as_polylines();
+            bool            ends_here = false;
+            for (const Polyline &polyline : whole)
+                ends_here = ends_here || strip.contains(polyline.first_point()) || strip.contains(polyline.last_point());
+            for (const Polyline &piece : intersection_pl(whole, strip.polygon()))
+                crossings.push_back({ unscaled<double>(piece.first_point().y() + piece.last_point().y()) / 2. - unscaled<double>(part.min.y()),
+                                      order, entity->inset_idx, entity->role() == erExternalPerimeter, { entity->inset_idx }, ends_here });
+            ++ order;
+        }
+    std::sort(crossings.begin(), crossings.end(), [](const SideCrossing &a, const SideCrossing &b) { return a.depth < b.depth; });
+    return crossings;
+}
+
+// The walls the layer lays across its y = 0 side at x mm from the part's -X side, from the outside in. Pieces less than
+// 0.1mm apart are one wall, split where its inset changes; it takes the order and inset of the piece extruded first.
+std::vector<SideCrossing> side_crossings(const Layer &layer, double x)
+{
+    std::vector<SideCrossing> walls;
+    for (const SideCrossing &crossing : raw_side_crossings(layer, x))
+        if (walls.empty() || crossing.depth - walls.back().depth > 0.1)
+            walls.push_back(crossing);
+        else {
+            std::vector<int> insets = std::move(walls.back().insets);
+            insets.push_back(crossing.inset);
+            if (crossing.order < walls.back().order)
+                walls.back() = crossing;
+            walls.back().insets = std::move(insets);
+        }
+    return walls;
+}
+
+// Where the layer lays two walls on top of each other across its y = 0 side at x mm from the part's -X side: pieces of
+// two walls less than a quarter of a spacing apart, where the walls of a bead count transition squeeze closer than
+// half a spacing without lying on each other. A wall that starts or ends there is a split point of the wall or the tip of
+// a bead count transition, where walls meet, and one wall doubling back is not two walls.
+bool walls_overlap_across_side(const Layer &layer, double x, double spacing)
+{
+    const std::vector<SideCrossing> crossings = raw_side_crossings(layer, x);
+    for (size_t i = 1; i < crossings.size(); ++ i)
+        if (crossings[i].depth - crossings[i - 1].depth < 0.25 * spacing && crossings[i].order != crossings[i - 1].order &&
+            ! crossings[i].ends_here && ! crossings[i - 1].ends_here)
+            return true;
+    return false;
+}
+
+// Number of walls the layer lays across its y = 0 side at x mm from the part's -X side, see side_crossings().
+size_t walls_across_side(const Layer &layer, double x)
+{
+    return side_crossings(layer, x).size();
+}
+
+// The spacing of the 0.45mm wide walls 0.2mm high of wall_ramp_config().
+const double ramp_wall_spacing = 0.45 - 0.2 * (1. - 0.25 * M_PI);
+
+// Where, from x = 17.5 outward to x = 8 mm in 0.1mm steps, the layer lays two walls on top of each other across its side.
+std::string overlapping_walls(const Layer &layer)
+{
+    std::string overlapped;
+    for (double x = 17.5; x >= 8.; x -= 0.1)
+        if (walls_overlap_across_side(layer, x, ramp_wall_spacing))
+            overlapped += "x=" + std::to_string(x) + "; ";
+    return overlapped;
 }
 
 } // namespace
@@ -2146,6 +2225,10 @@ TEST_CASE("A modifier with more walls and a ramped transition tapers the walls f
     CAPTURE(counts);
     CHECK(std::is_sorted(counts.rbegin(), counts.rend()));
     CHECK(std::find(counts.begin(), counts.end(), 3) != counts.end());
+    // The walls the count merges, 0.1mm apart, are not walls laid on top of each other.
+    const std::string overlapped = overlapping_walls(*layer);
+    CAPTURE(overlapped);
+    CHECK(overlapped.empty());
     CHECK(perimeter_warnings(print).empty());
 }
 
@@ -2276,4 +2359,216 @@ TEST_CASE("A modifier with a ramped transition whose base wall count differs bet
     CHECK(walls_across_side(*lower, 17.5) == 2);
     CHECK(walls_across_side(*upper, 17.5) == 3);
     CHECK_THAT(perimeter_warnings(print), Catch::Matchers::ContainsSubstring("every height range"));
+}
+
+namespace {
+
+// The ramp fixture of the tests below: the part's 2 walls rising to 4 in the modifier, over a ramp 5 bead widths
+// long per wall.
+DynamicPrintConfig wall_ramp_modifier_config()
+{
+    return wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } });
+}
+
+// Length of the G-code's extrusions of one feature type, such as "Outer wall".
+double feature_length(const std::string &gcode, const std::string &feature)
+{
+    double      length = 0.;
+    std::string current;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string &raw = line.raw();
+        for (const std::string_view tag : { std::string_view("; FEATURE: "), std::string_view(";TYPE:") })
+            if (raw.rfind(tag, 0) == 0)
+                current = raw.substr(tag.size());
+        if (current == feature && line.extruding(self))
+            length += line.dist_XY(self);
+    });
+    return length;
+}
+
+// How far in from the part's y = 0 side `area` starts at x mm from the part's -X side.
+double depth_from_side(const Layer &layer, const ExPolygons &area, double x)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const coord_t     px   = part.min.x() + scaled<coord_t>(x);
+    const Polyline    probe(Point(px, part.min.y() - scaled<coord_t>(1.)), Point(px, part.center().y()));
+    coord_t           first = part.center().y();
+    for (const Polyline &piece : intersection_pl(Polylines{ probe }, area))
+        first = std::min({ first, piece.first_point().y(), piece.last_point().y() });
+    return unscaled<double>(first - part.min.y());
+}
+
+// How far the infill runs into the walls at x mm from the part's -X side: the region the walls leave unfilled
+// minus the infill region, measured in from the y = 0 side.
+double infill_wall_overlap_at(const Layer &layer, double x)
+{
+    ExPolygons infill, unfilled;
+    for (const LayerRegion *region : layer.regions()) {
+        append(infill, region->fill_expolygons);
+        append(unfilled, region->fill_no_overlap_expolygons);
+    }
+    return depth_from_side(layer, union_ex(unfilled), x) - depth_from_side(layer, union_ex(infill), x);
+}
+
+} // namespace
+
+// Arachne walls the band from both of its edges, but only its edge on the slice contour is an outer wall.
+TEST_CASE("A layer with a ramp band has one closed outer wall per contour", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("arachne"), wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    size_t contours = 0;
+    for (const ExPolygon &island : layer->lslices)
+        contours += 1 + island.holes.size();
+    size_t outer_loops = 0, outer_open = 0;
+    for (const LayerRegion *region : layer->regions())
+        for (const ExtrusionEntity *entity : region->perimeters.flatten().entities)
+            if (entity->role() == erExternalPerimeter)
+                ++ (entity->is_loop() ? outer_loops : outer_open);
+    CHECK(contours == 1);
+    CHECK(outer_loops == contours);
+    CHECK(outer_open == 0);
+
+    // The G-code lays one outer wall loop, 0.45mm wide, around the 20x20 contour, give or take the seam gap.
+    const double outer_wall = feature_length(layer_gcode(gcode(print), print_z), "Outer wall");
+    CHECK_THAT(outer_wall, Catch::Matchers::WithinAbs(4. * (20. - 0.45), 1.));
+}
+
+// Inset 0 is the outer wall and each wall further in takes the next inset, through the zone, the ramp and beyond.
+TEST_CASE("A layer with a ramp band numbers its walls inward from the outer wall", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("arachne"), wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    REQUIRE(walls_across_side(*layer, 17.5) == 4);
+    // Where the walls across the side, from the outside in, are not insets 0, 1, 2...
+    std::string misnumbered;
+    for (double x = 17.5; x >= 8.; x -= 0.1) {
+        std::string insets;
+        bool        in_order = true;
+        int         next     = 0;
+        // Where a wall is split, either piece may take its place.
+        for (const SideCrossing &wall : side_crossings(*layer, x)) {
+            in_order = in_order && std::find(wall.insets.begin(), wall.insets.end(), next ++) != wall.insets.end();
+            insets += " " + std::to_string(wall.inset);
+        }
+        if (! in_order)
+            misnumbered += "x=" + std::to_string(x) + ":" + insets + "; ";
+    }
+    CAPTURE(misnumbered);
+    CHECK(misnumbered.empty());
+    const std::string overlapped = overlapping_walls(*layer);
+    CAPTURE(overlapped);
+    CHECK(overlapped.empty());
+}
+
+// The infill overlaps the walls by a share of the inner wall spacing wherever there is more than one wall. A band
+// numbered from both edges would count half its walls, and use the outer wall spacing at 2 walls.
+TEST_CASE("The infill overlaps the walls of a ramp band as it does stock walls of the same count", "[Perimeters][WallRamp]")
+{
+    // Outer walls narrower than the inner ones, so an overlap taken from the outer wall spacing shows.
+    DynamicPrintConfig config = wall_ramp_config("arachne", 1);
+    config.set_deserialize_strict({ { "outer_wall_line_width", 0.42 }, { "inner_wall_line_width", 0.5 }, { "line_width", 0.5 },
+                                    { "infill_wall_overlap", "50%" } });
+
+    Print stock_print, ramp_print;
+    Model stock_model, ramp_model;
+    slice_parts_with_modifiers(stock_print, stock_model, config, { 2 }, {});
+    part_with_wall_modifier(ramp_print, ramp_model, config,
+                            wall_modifier_config({ { "wall_loops", 2 }, { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } }));
+    const Layer *stock = layer_at(stock_print, ramp_layer_z);
+    const Layer *ramp  = layer_at(ramp_print, ramp_layer_z);
+    REQUIRE(stock != nullptr);
+    REQUIRE(ramp != nullptr);
+
+    // In the zone the band has the stock layer's 2 walls.
+    REQUIRE(walls_across_side(*stock, 17.5) == 2);
+    REQUIRE(walls_across_side(*ramp, 17.5) == 2);
+    const double stock_overlap = infill_wall_overlap_at(*stock, 17.5);
+    // Half the inner wall spacing: 0.5mm wide, 0.2mm high.
+    CHECK_THAT(stock_overlap, Catch::Matchers::WithinAbs(0.5 * (0.5 - 0.2 * (1. - 0.25 * M_PI)), 0.01));
+    CHECK_THAT(infill_wall_overlap_at(*ramp, 17.5), Catch::Matchers::WithinAbs(stock_overlap, 0.01));
+}
+
+// Each wall sequence orders the band's walls as it orders stock walls, by their depth from the outer wall.
+TEST_CASE("A layer with a ramp band prints its walls in the wall sequence order", "[Perimeters][WallRamp]")
+{
+    const std::string wall_sequence = GENERATE("inner wall/outer wall", "outer wall/inner wall", "inner-outer-inner wall");
+    CAPTURE(wall_sequence);
+
+    DynamicPrintConfig config = wall_ramp_config("arachne");
+    config.set_deserialize_strict({ { "wall_sequence", wall_sequence } });
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+
+    // In the zone, the 4 walls by depth, then in extrusion order.
+    std::vector<SideCrossing> walls = side_crossings(*layer, 17.5);
+    REQUIRE(walls.size() == 4);
+    std::vector<std::pair<size_t, int>> order_and_depth;
+    for (size_t depth = 0; depth < walls.size(); ++ depth)
+        order_and_depth.emplace_back(walls[depth].order, int(depth));
+    std::sort(order_and_depth.begin(), order_and_depth.end());
+    std::vector<int> printed;
+    for (const auto &[order, depth] : order_and_depth)
+        printed.push_back(depth);
+    CHECK(printed == wall_sequence_insets(wall_sequence, false, 3));
+}
+
+// A piece of a wall shorter than a bead cannot be printed as one, so the wall's neighbouring piece takes it over.
+TEST_CASE("A layer with a ramp band has no wall piece shorter than the wall spacing", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("arachne"), wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    // Only the pieces of a wall split where its depth changes are merged when short; an open Arachne wall that is
+    // short to begin with is left alone. A split piece ends at a point it shares with the neighbouring piece of the
+    // same wall, which has another inset, so the check is on open walls that meet another open wall of a different
+    // inset at one of their ends.
+    // flatten() returns a collection that owns its entities, so keep each one alive while `open` points into it.
+    std::vector<ExtrusionEntityCollection> walls;
+    for (const LayerRegion *region : layer->regions())
+        walls.emplace_back(region->perimeters.flatten());
+    std::vector<const ExtrusionEntity *> open;
+    for (const ExtrusionEntityCollection &collection : walls)
+        for (const ExtrusionEntity *entity : collection.entities)
+            if (! entity->is_loop())
+                open.push_back(entity);
+    size_t pieces = 0;
+    double shortest = std::numeric_limits<double>::max();
+    for (const ExtrusionEntity *entity : open) {
+        const bool split = std::any_of(open.begin(), open.end(), [entity](const ExtrusionEntity *other) {
+            return other != entity && other->inset_idx != entity->inset_idx &&
+                   (other->first_point() == entity->first_point() || other->first_point() == entity->last_point() ||
+                    other->last_point() == entity->first_point() || other->last_point() == entity->last_point());
+        });
+        if (split) {
+            ++ pieces;
+            shortest = std::min(shortest, unscaled<double>(total_length(entity->as_polylines())));
+        }
+    }
+    REQUIRE(pieces > 0);
+    CHECK(shortest >= ramp_wall_spacing);
 }

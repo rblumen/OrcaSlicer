@@ -9,8 +9,10 @@
 // stock wall path is untouched wherever no Ramp modifier changes the wall count.
 
 #include "Arachne/WallToolPaths.hpp"
+#include "Arachne/utils/ExtrusionLine.hpp"
 #include "ExPolygon.hpp"
 #include "Polygon.hpp"
+#include "libslic3r.h"
 
 #include <memory>
 #include <optional>
@@ -63,5 +65,13 @@ struct WallBandPaths
 // extra walls on overhangs). The band wins over one wall on top surfaces.
 std::optional<WallBandPaths> wall_band_paths(const PerimeterGenerator &generator, const Surface &surface, const ExPolygons &island,
                                              const Arachne::WallToolPathsParams &params);
+
+// Renumbers the walls Arachne laid in a band by their depth from the outer wall, as stock walls are numbered, and
+// groups `perimeters` by the new insets, so that its size is the wall count. Arachne numbers the band's walls from
+// both of its edges: the bead along its inner edge comes out as a second outer wall, and the count as about half.
+// A wall's depth is the number of walls between it and the outline of `island`, the island the band was built on;
+// `spacing` is the inner wall spacing. A wall whose depth changes along it, as on the ramp, is split where it does.
+// A closed wall runs as the contour or the hole it follows, which the band's inner edge turns around.
+void number_wall_band_insets(std::vector<Arachne::VariableWidthLines> &perimeters, const ExPolygons &island, coord_t spacing);
 
 } // namespace Slic3r

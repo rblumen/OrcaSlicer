@@ -1,10 +1,14 @@
 #include "WallBand.hpp"
 
+#include "AABBTreeLines.hpp"
+#include "Arachne/utils/ExtrusionJunction.hpp"
+#include "Arachne/utils/ExtrusionLine.hpp"
 #include "BoundingBox.hpp"
 #include "ClipperUtils.hpp"
 #include "Flow.hpp"
 #include "Geometry.hpp"
 #include "Layer.hpp"
+#include "Line.hpp"
 #include "Model.hpp"
 #include "PerimeterGenerator.hpp"
 #include "Point.hpp"
@@ -20,8 +24,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <iterator>
 #include <map>
 #include <optional>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -229,6 +235,232 @@ std::optional<WallBandPaths> wall_band_paths(const PerimeterGenerator &generator
     out.params.wall_transition_angle = wall_band_transition_angle(params.wall_transition_angle, field->min_taper_ratio());
     out.infill_contour = union_ex(inner);
     return out;
+}
+
+// Not renumber_inner_walls_by_depth() of PerimeterGenerator.cpp: that renumbers whole lines by the walls they touch and
+// cannot split one where its depth changes, which a wall along a ramp needs. The two can number the same geometry
+// differently.
+void number_wall_band_insets(std::vector<Arachne::VariableWidthLines> &perimeters, const ExPolygons &island, coord_t spacing)
+{
+    // The island's outline, and whether each of its lines lies on a contour rather than a hole.
+    Lines             lines;
+    std::vector<bool> on_contour;
+    for (const ExPolygon &expolygon : island)
+        for (size_t i = 0; i <= expolygon.holes.size(); ++ i) {
+            Lines polygon_lines = (i == 0 ? expolygon.contour : expolygon.holes[i - 1]).lines();
+            on_contour.insert(on_contour.end(), polygon_lines.size(), i == 0);
+            append(lines, std::move(polygon_lines));
+        }
+    const AABBTreeLines::LinesDistancer<Line> outline(std::move(lines));
+    Lines wall_lines;
+    for (const Arachne::VariableWidthLines &walls : perimeters)
+        for (const Arachne::ExtrusionLine &line : walls)
+            for (size_t i = 1; i < line.junctions.size(); ++ i)
+                wall_lines.emplace_back(line.junctions[i - 1].p, line.junctions[i].p);
+    const AABBTreeLines::LinesDistancer<Line> all_walls(std::move(wall_lines));
+
+    // The inset at a point of a wall: the number of walls the line from it to the nearest point of the outline
+    // crosses. Arachne widens beads where a wall count does not fit, so a distance divided by the spacing would
+    // miscount them. Crossings less than a quarter of the spacing apart are one wall, the point's own among them.
+    const double gap      = 0.25 * double(spacing);
+    auto         inset_at = [&](const Point &p) {
+        const Point to(std::get<2>(outline.distance_from_lines_extra<false>(p)).cast<coord_t>());
+        size_t      count = 0;
+        double      last  = 0.;
+        for (const auto &crossing : all_walls.intersections_with_line<true>(Line(p, to)))
+            if (const double s = (crossing.first - p).cast<double>().norm(); s - last >= gap) {
+                ++ count;
+                last = s;
+            }
+        return count;
+    };
+
+    std::vector<Arachne::VariableWidthLines> numbered;
+    auto add = [&numbered](Arachne::ExtrusionLine &&line, size_t inset) {
+        line.inset_idx = inset;
+        for (Arachne::ExtrusionJunction &junction : line.junctions)
+            junction.perimeter_index = inset;
+        if (numbered.size() <= inset)
+            numbered.resize(inset + 1);
+        numbered[inset].emplace_back(std::move(line));
+    };
+
+    // A junction of a wall and the inset from it on, or one added where the inset changes.
+    struct Node
+    {
+        Arachne::ExtrusionJunction junction;
+        size_t                     inset;
+        bool                       split;
+    };
+    auto between = [](const Arachne::ExtrusionJunction &a, const Arachne::ExtrusionJunction &b, double t) {
+        return Arachne::ExtrusionJunction(Point((a.p.cast<double>() + t * (b.p - a.p).cast<double>()).cast<coord_t>()),
+                                          coord_t(double(a.w) + t * double(b.w - a.w)), 0);
+    };
+    // Adds the points between a and b, from t0 at inset0 to t1 at inset1, where the inset changes, to 10 microns.
+    const double resolution = scaled<double>(0.01);
+    auto add_splits = [&](auto &self, const Arachne::ExtrusionJunction &a, const Arachne::ExtrusionJunction &b, double t0, size_t inset0,
+                          double t1, size_t inset1, std::vector<Node> &nodes) -> void {
+        if (inset0 == inset1)
+            return;
+        const Arachne::ExtrusionJunction middle = between(a, b, 0.5 * (t0 + t1));
+        if ((t1 - t0) * (b.p - a.p).cast<double>().norm() < resolution) {
+            nodes.push_back({ middle, inset1, true });
+            return;
+        }
+        const size_t inset = inset_at(middle.p);
+        self(self, a, b, t0, inset0, 0.5 * (t0 + t1), inset, nodes);
+        self(self, a, b, 0.5 * (t0 + t1), inset, t1, inset1, nodes);
+    };
+
+    // A run of a wall at one inset, from one split to the next.
+    struct Piece
+    {
+        std::vector<Arachne::ExtrusionJunction> junctions;
+        size_t                                  inset;
+        double length() const
+        {
+            double sum = 0.;
+            for (size_t i = 1; i < junctions.size(); ++ i)
+                sum += (junctions[i].p - junctions[i - 1].p).cast<double>().norm();
+            return sum;
+        }
+    };
+    // Joins piece `k` and the piece after it (the first, after the last of a closed wall) into one at `inset`.
+    auto join_with_next = [](std::vector<Piece> &pieces, size_t k, size_t inset) {
+        const size_t next = (k + 1) % pieces.size();
+        Piece        joined { std::move(pieces[k].junctions), inset };
+        joined.junctions.insert(joined.junctions.end(), std::make_move_iterator(pieces[next].junctions.begin() + 1),
+                                std::make_move_iterator(pieces[next].junctions.end()));
+        pieces[k] = std::move(joined);
+        pieces.erase(pieces.begin() + next);
+    };
+
+    for (Arachne::VariableWidthLines &walls : perimeters)
+        for (Arachne::ExtrusionLine &line : walls) {
+            std::vector<Arachne::ExtrusionJunction> &junctions = line.junctions;
+            if (line.is_closed && junctions.size() > 1 && junctions.front().p == junctions.back().p)
+                junctions.pop_back();
+            if (junctions.size() < 2) {
+                if (! junctions.empty())
+                    add(std::move(line), inset_at(junctions.front().p));
+                continue;
+            }
+            const size_t        n = junctions.size();
+            std::vector<size_t> insets;
+            insets.reserve(n);
+            for (const Arachne::ExtrusionJunction &junction : junctions)
+                insets.emplace_back(inset_at(junction.p));
+
+            std::vector<Node> nodes;
+            for (size_t i = 0; i < (line.is_closed ? n : n - 1); ++ i) {
+                const size_t next = (i + 1) % n;
+                nodes.push_back({ junctions[i], insets[i], false });
+                // The inset is sampled about every spacing along the segment, so that a change within a long one is found.
+                const size_t samples  = std::max<size_t>(1, size_t(std::ceil((junctions[next].p - junctions[i].p).cast<double>().norm() / double(spacing))));
+                size_t       previous = insets[i];
+                for (size_t s = 1; s <= samples; ++ s) {
+                    const double t     = double(s) / double(samples);
+                    const size_t inset = s == samples ? insets[next] : inset_at(between(junctions[i], junctions[next], t).p);
+                    add_splits(add_splits, junctions[i], junctions[next], double(s - 1) / double(samples), previous, t, inset, nodes);
+                    previous = inset;
+                }
+            }
+            if (line.is_closed) {
+                // Start at a split, so that every piece runs from one to the next.
+                const auto first_split = std::find_if(nodes.begin(), nodes.end(), [](const Node &node) { return node.split; });
+                if (first_split != nodes.end())
+                    std::rotate(nodes.begin(), first_split, nodes.end());
+                nodes.push_back(nodes.front());
+            } else
+                nodes.push_back({ junctions.back(), insets.back(), false });
+
+            // The pieces from split to split.
+            std::vector<Piece> pieces;
+            size_t             begin = 0;
+            for (size_t i = 1; i < nodes.size(); ++ i)
+                if (nodes[i].split || i + 1 == nodes.size()) {
+                    Piece piece { {}, nodes[begin].inset };
+                    for (size_t j = begin; j <= i; ++ j)
+                        piece.junctions.emplace_back(nodes[j].junction);
+                    pieces.emplace_back(std::move(piece));
+                    begin = i;
+                }
+
+            // A piece shorter than a bead takes the inset of its longer neighbour along the wall, which is a closed
+            // wall's other end as well; neighbours at one inset are one piece.
+            const bool closed = line.is_closed;
+            while (pieces.size() > 1) {
+                const size_t count = pieces.size();
+                size_t       same  = count;
+                for (size_t i = 0; i < (closed ? count : count - 1) && same == count; ++ i)
+                    if (pieces[i].inset == pieces[(i + 1) % count].inset)
+                        same = i;
+                if (same < count) {
+                    join_with_next(pieces, same, pieces[same].inset);
+                    continue;
+                }
+                size_t shortest = count;
+                double shortest_length = double(spacing);
+                for (size_t i = 0; i < count; ++ i)
+                    if (const double length = pieces[i].length(); length < shortest_length) {
+                        shortest        = i;
+                        shortest_length = length;
+                    }
+                if (shortest == count)
+                    break;
+                const bool   has_prev  = closed || shortest > 0;
+                const bool   has_next  = closed || shortest + 1 < count;
+                const size_t prev      = (shortest + count - 1) % count;
+                const size_t next      = (shortest + 1) % count;
+                const bool   use_prev  = has_prev && (! has_next || pieces[prev].length() >= pieces[next].length());
+                if (use_prev)
+                    join_with_next(pieces, prev, pieces[prev].inset);
+                else
+                    join_with_next(pieces, shortest, pieces[next].inset);
+            }
+
+            if (pieces.size() == 1) {
+                // The wall keeps its line, a closed one running clockwise when it follows a contour and counterclockwise
+                // when it follows a hole, see Arachne::ExtrusionLine::is_contour(), as most of its junctions do.
+                junctions = std::move(pieces.front().junctions);
+                if (line.is_closed) {
+                    // Each sampled junction votes with the length of wall around it, so that a short stretch of many
+                    // junctions along a faceted hole does not outvote long straight sides. The closing junction repeats
+                    // the first and is left out.
+                    const size_t        count = junctions.size() - 1;
+                    std::vector<double> cumulative(count + 1, 0.);
+                    for (size_t i = 0; i < count; ++ i)
+                        cumulative[i + 1] = cumulative[i] + (junctions[i + 1].p - junctions[i].p).cast<double>().norm();
+                    const size_t        step = std::max<size_t>(1, count / 32);
+                    std::vector<size_t> sampled;
+                    for (size_t i = 0; i < count; i += step)
+                        sampled.push_back(i);
+                    double on_contour_length = 0., total_length = 0.;
+                    for (size_t k = 0; k < sampled.size(); ++ k) {
+                        const size_t i     = sampled[k];
+                        const size_t after = sampled[(k + 1) % sampled.size()];
+                        const size_t before = sampled[(k + sampled.size() - 1) % sampled.size()];
+                        const double to_next = after > i ? cumulative[after] - cumulative[i] : cumulative[count] - cumulative[i] + cumulative[after];
+                        const double from_prev = i > before ? cumulative[i] - cumulative[before] : cumulative[count] - cumulative[before] + cumulative[i];
+                        const double weight = 0.5 * (to_next + from_prev);
+                        total_length += weight;
+                        if (on_contour[std::get<1>(outline.distance_from_lines_extra<false>(junctions[i].p))])
+                            on_contour_length += weight;
+                    }
+                    if (line.is_contour() != (2. * on_contour_length >= total_length))
+                        std::reverse(junctions.begin(), junctions.end());
+                }
+                add(std::move(line), pieces.front().inset);
+                continue;
+            }
+            for (Piece &piece : pieces) {
+                Arachne::ExtrusionLine out(0, line.is_odd);
+                out.junctions = std::move(piece.junctions);
+                if (out.getLength() > 0)
+                    add(std::move(out), piece.inset);
+            }
+        }
+    perimeters = std::move(numbered);
 }
 
 } // namespace Slic3r
