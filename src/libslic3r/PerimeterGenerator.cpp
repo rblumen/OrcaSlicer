@@ -2749,6 +2749,7 @@ void PerimeterGenerator::process_arachne()
             Arachne::WallToolPaths wallToolPaths(last_p, bead_width_0, perimeter_spacing, coord_t(loop_number + 1),
                                                    wall_0_inset, layer_height, input_params_tmp);
             std::vector<Arachne::VariableWidthLines>   perimeters = wallToolPaths.getToolPaths();
+            if (band) number_wall_band_insets(perimeters, last, perimeter_spacing);
             ExPolygons  infill_contour = band ? std::move(band->infill_contour) : union_ex(wallToolPaths.getInnerContour());
 
             // Check if there are some remaining perimeters to generate (the number of perimeters
