@@ -2538,9 +2538,11 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
     // Orca: a modifier with the Ramp wall count transition keeps all its walls under top surfaces, so Only one wall on
     // top surfaces set on the modifier itself contradicts it. A value inherited from the process is overridden quietly.
+    // With the Classic wall generator the modifier uses the Hard transition instead, see below.
     for (const PrintObject *print_object : m_objects)
         for (const ModelVolume *volume : print_object->model_object()->volumes) {
-            if (! volume->is_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
+            if (print_object->config().wall_generator.value != PerimeterGeneratorType::Arachne ||
+                ! volume->is_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
                 continue;
             const DynamicPrintConfig &cfg = volume->config.get();
             const bool ramp = (cfg.has("wall_loops_transition") ? cfg.opt_enum<WallLoopsTransition>("wall_loops_transition") :
@@ -2553,6 +2555,24 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                         volume->name, print_object->model_object()->name),
                          print_object->model_object(), "only_one_wall_top" };
         }
+
+    // Orca: only Arachne walls follow the Ramp wall count transition, so with the Classic wall generator a modifier set
+    // to Ramp uses the Hard transition, see wall_ramp_key() in PrintApply.cpp. Warn once per object.
+    std::set<const ModelObject*> classic_ramp_objects;
+    for (const PrintObject *print_object : m_objects) {
+        const ModelObject *model_object = print_object->model_object();
+        if (print_object->config().wall_generator.value == PerimeterGeneratorType::Arachne || classic_ramp_objects.count(model_object) > 0 ||
+            std::none_of(model_object->volumes.begin(), model_object->volumes.end(), [](const ModelVolume *volume) {
+                const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option("wall_loops_transition") : nullptr;
+                return transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp); }))
+            continue;
+        classic_ramp_objects.insert(model_object);
+        // TRN: %1% is the name of an object. "Wall generator" is the name of a setting, "Arachne" and "Classic" are its values.
+        warn(Slic3r::format(_u8L("The Ramp wall count transition of object %1% needs Wall generator set to Arachne; with Classic it uses "
+                                 "the Hard transition."),
+                            model_object->name),
+             "wall_generator", model_object);
+    }
 
     // Cache of layer height profiles for checking:
     // 1) Whether all layers are synchronized if printing with wipe tower and / or unsynchronized supports.

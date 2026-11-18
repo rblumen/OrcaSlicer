@@ -824,11 +824,12 @@ int  print_region_ref_cnt(const PrintRegion &r) { return r.m_ref_cnt; }
 
 // Orca: PrintRegion::wall_ramp_key() of the region of the modifier `volume` over `parent`. Only a modifier setting the
 // Ramp transition itself has one: the transition is not inherited from the process, the object, a layer range or an
-// enclosing modifier.
-static WallRampKey wall_ramp_key(const ModelVolume &volume, const PrintRegion &parent)
+// enclosing modifier. Only Arachne walls follow the ramp, so with the Classic wall generator the modifier keeps the Hard
+// transition: its region is not keyed and walls its own outline, see Print::validate().
+static WallRampKey wall_ramp_key(const ModelVolume &volume, const PrintRegion &parent, bool arachne)
 {
     const ConfigOption *transition = volume.config.option("wall_loops_transition");
-    return transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp) ?
+    return arachne && transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp) ?
         WallRampKey{ parent.config().wall_loops.value, parent.wall_group_loops() } : WallRampKey{};
 }
 
@@ -841,7 +842,9 @@ bool verify_update_print_object_regions(
     size_t                              num_extruders,
     PrintObjectRegions                 &print_object_regions,
     const std::function<void(const PrintRegionConfig&, const PrintRegionConfig&, const t_config_option_keys&)> &callback_invalidate,
-    std::vector<int>& variant_index)
+    std::vector<int>& variant_index,
+    // Orca: whether the object's wall generator is Arachne, see wall_ramp_key().
+    bool arachne)
 {
     // Sort by ModelVolume ID.
     model_volumes_sort_by_id(model_volumes);
@@ -898,7 +901,7 @@ bool verify_update_print_object_regions(
                     region_config_from_model_volume(layer_range.volume_regions[region.parent].region->config(), nullptr, **it_model_volume, num_extruders, variant_index);
                 // Orca: A modifier that does not modify its parent shares the parent's region and keeps its key.
                 const PrintRegion *parent = region.parent == -1 ? nullptr : layer_range.volume_regions[region.parent].region;
-                const WallRampKey key = parent == nullptr || parent == region.region ? region.region->wall_ramp_key() : wall_ramp_key(**it_model_volume, *parent);
+                const WallRampKey key = parent == nullptr || parent == region.region ? region.region->wall_ramp_key() : wall_ramp_key(**it_model_volume, *parent, arachne);
                 if (cfg != region.region->config() || key != region.region->wall_ramp_key()) {
                     // Region configuration changed.
                     if (print_region_ref_cnt(*region.region) == 0) {
@@ -1083,6 +1086,8 @@ static PrintObjectRegions* generate_print_object_regions(
     const std::vector<unsigned int>             &painting_extruders,
     std::vector<int>                            &variant_index,
     const bool                                   has_painted_fuzzy_skin,
+    // Orca: whether the object's wall generator is Arachne, see wall_ramp_key().
+    const bool                                   arachne,
     // Per-part gradient: slot_per_part_enabled[s-1] is true when mixed slot s has
     // filament_mixed_gradient_per_part on. Empty / all-false preserves legacy behavior.
     const std::vector<bool>                     &slot_per_part_enabled = {})
@@ -1226,7 +1231,7 @@ static PrintObjectRegions* generate_print_object_regions(
                                     if (PrintRegionConfig config = region_config_from_model_volume(parent_region.region->config(), nullptr, volume, num_extruders, variant_index);
                                         config != parent_region.region->config()) {
                                         added = true;
-                                        const WallRampKey key = wall_ramp_key(volume, *parent_region.region);
+                                        const WallRampKey key = wall_ramp_key(volume, *parent_region.region, arachne);
                                         layer_range.volume_regions.push_back({ &volume, parent_region_id, get_create_region(std::move(config), ObjectID(), key), bbox });
                                     } else if (parent_model_part_id == -1 && parent_volume.is_model_part())
                                         parent_model_part_id = parent_region_id;
@@ -2153,6 +2158,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         const ModelObject  &model_object         = *print_object.model_object();
         ModelObjectStatus  &model_object_status  = const_cast<ModelObjectStatus&>(model_object_status_db.reuse(model_object));
         PrintObjectRegions *print_object_regions = model_object_status.print_object_regions;
+        // Orca: the object's config is already up to date, and a change of the wall generator reslices it.
+        const bool          arachne              = print_object.config().wall_generator.value == PerimeterGeneratorType::Arachne;
         for (++ it_print_object_end; it_print_object_end != m_objects.end() && (*it_print_object)->model_object() == (*it_print_object_end)->model_object(); ++ it_print_object_end)
             assert((*it_print_object_end)->m_shared_regions == nullptr || (*it_print_object_end)->m_shared_regions == print_object_regions);
         if (print_object_regions == nullptr) {
@@ -2203,7 +2210,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                             if ((*it)->m_shared_regions != nullptr)
                                 update_apply_status((*it)->invalidate_state_by_config_options(old_config, new_config, diff_keys));
                     },
-                    print_variant_index)) {
+                    print_variant_index,
+                    arachne)) {
                 // Per-part gradient: PrintRegionConfig alone cannot reveal a change in which slots
                 // have per-part enabled, so compare against the snapshot taken when these regions
                 // were generated and regenerate on any difference (slot toggled, per-part moved
@@ -2238,6 +2246,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 painting_extruders,
                 print_variant_index,
                 print_object.is_fuzzy_skin_painted(),
+                arachne,
                 slot_per_part_enabled);
         }
         for (auto it = it_print_object; it != it_print_object_end; ++it)
