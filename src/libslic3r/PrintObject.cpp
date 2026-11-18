@@ -695,9 +695,6 @@ void PrintObject::make_perimeters()
         if (skipped & wbsAlternateExtraWall)
             // TRN: %1% is the name of an object.
             warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to some layers of object %1% because Alternate extra wall is enabled."), name));
-        if (skipped & wbsOnlyOneWallTop)
-            // TRN: %1% is the name of an object.
-            warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to some layers of object %1% because Only one wall on top surfaces is enabled."), name));
         if (skipped & wbsOnlyOneWallFirstLayer)
             // TRN: %1% is the name of an object.
             warn(Slic3r::format(_u8L("The Ramp wall count transition is not applied to the first layer of object %1% because Only one wall on first layer is enabled."), name));

@@ -2160,11 +2160,50 @@ TEST_CASE("An island in a ramp zone that takes alternating extra walls keeps the
     CHECK_THAT(perimeter_warnings(print), Catch::Matchers::ContainsSubstring("Alternate extra wall"));
 }
 
-// only_one_wall_top has nothing to act on without a top shell, so it must not keep the band from the zone.
-TEST_CASE("The only one wall on top option does not stop the ramp walls where there is no top shell", "[Perimeters][WallRamp]")
+// The band wins over only_one_wall_top: the walls of the zone are all kept, and the one-wall-top second pass does not
+// add inner walls on top of them.
+TEST_CASE("The ramp walls are kept in the zone where only one wall on top surfaces is enabled", "[Perimeters][WallRamp]")
 {
     DynamicPrintConfig config = wall_ramp_config("arachne");
-    config.set_deserialize_strict({ { "only_one_wall_top", 1 }, { "top_shell_layers", 0 } });
+    config.set_deserialize_strict({ { "only_one_wall_top", 1 }, { "top_shell_layers", 3 } });
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } }));
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK(walls_across_side(*layer, 17.5) == 4);
+    CHECK(perimeter_warnings(print).empty());
+
+    // A 1mm slab over x = 0..8 on top of the part leaves a top surface across the zone on the part's last layer
+    // below it, where only one wall on top surfaces would lay inner walls of its own. The walls there are the
+    // ones the option leaves out.
+    auto ledge_wall_length = [&](int one_wall_top) {
+        DynamicPrintConfig ledge_config = config;
+        ledge_config.set_deserialize_strict({ { "only_one_wall_top", one_wall_top } });
+        Print ledge_print;
+        Model ledge_model;
+        slice_parts_with_modifiers(ledge_print, ledge_model, ledge_config, { -1 },
+                                   { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } })) },
+                                   [](ModelObject &object) {
+                                       TriangleMesh slab = make_cube(8., 20., 1.);
+                                       slab.translate(0.f, 0.f, 2.f);
+                                       object.add_volume(std::move(slab), ModelVolumeType::MODEL_PART, false);
+                                   });
+        const Layer *ledge = layer_at(ledge_print, 2.0);
+        REQUIRE(ledge != nullptr);
+        Polylines walls;
+        for (const LayerRegion *region : ledge->regions())
+            append(walls, region->perimeters.as_polylines());
+        return unscaled<double>(total_length(walls));
+    };
+    CHECK_THAT(ledge_wall_length(1), Catch::Matchers::WithinAbs(ledge_wall_length(0), 1.));
+}
+
+// Alternate extra wall adds a wall only with sparse infill to alternate it with, as in process_arachne().
+TEST_CASE("The ramp walls apply without a warning where alternate extra wall has no sparse infill to act on", "[Perimeters][WallRamp]")
+{
+    DynamicPrintConfig config = wall_ramp_config("arachne");
+    config.set_deserialize_strict({ { "alternate_extra_wall", 1 }, { "sparse_infill_density", "0%" } });
     Print print;
     Model model;
     part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } }));
@@ -2174,10 +2213,36 @@ TEST_CASE("The only one wall on top option does not stop the ramp walls where th
     CHECK(perimeter_warnings(print).empty());
 }
 
+// Only one wall on top surfaces set on a modifier that keeps all its walls under top surfaces contradicts it.
+TEST_CASE("Print validation rejects a ramp modifier with its own only one wall on top surfaces setting", "[Perimeters][WallRamp]")
+{
+    struct Variant { const char *name; const char *transition; bool explicit_on_modifier; int wall_loops; bool error; };
+    const Variant variant = GENERATE(
+        Variant{ "explicit on a ramp modifier",        "ramp", true,  4, true },
+        Variant{ "inherited from the process",         "ramp", false, 4, false },
+        Variant{ "explicit on a hard modifier",        "hard", true,  4, false },
+        Variant{ "explicit on a one wall modifier",    "ramp", true,  1, false });
+    CAPTURE(variant.name);
+
+    DynamicPrintConfig config = wall_ramp_config("arachne");
+    config.set_deserialize_strict({ { "only_one_wall_top", variant.explicit_on_modifier ? 0 : 1 }, { "top_shell_layers", 3 } });
+    DynamicPrintConfig modifier = wall_modifier_config({ { "wall_loops", variant.wall_loops }, { "wall_loops_transition", variant.transition },
+                                                         { "wall_ramp_taper_ratio", 5. } });
+    if (variant.explicit_on_modifier)
+        modifier.set_deserialize_strict({ { "only_one_wall_top", 1 } });
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, modifier);
+    const std::string error = print.validate().string;
+    // The test config trips unrelated validation errors, so look for this one only.
+    const bool reported = error.find("uses the Ramp wall count transition") != std::string::npos;
+    CHECK(reported == variant.error);
+}
+
 TEST_CASE("A steep ramp raises the transition angle no further than the option allows", "[Perimeters][WallRamp]")
 {
     const double max_angle = print_config_def.get("wall_transition_angle")->max;
-    CHECK(wall_band_transition_angle(10.f, 0.5) <= max_angle);
+    CHECK_THAT(wall_band_transition_angle(10.f, 0.5), Catch::Matchers::WithinAbs(max_angle, 1e-3));
     // A gentle ramp raises it only by what it needs.
     CHECK_THAT(wall_band_transition_angle(10.f, 10.), Catch::Matchers::WithinAbs(std::atan(0.1) * 180. / M_PI + 5., 1e-3));
 

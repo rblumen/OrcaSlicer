@@ -2734,7 +2734,7 @@ void PerimeterGenerator::process_arachne()
             //PS: One wall top surface for Arachne
             ExPolygons top_expolygons;
             // Calculate how many inner loops remain when TopSurfaces is selected.
-            const int inner_loop_number = (only_one_wall_top && upper_slices != nullptr) ? loop_number - 1 : -1;
+            int inner_loop_number = (only_one_wall_top && upper_slices != nullptr) ? loop_number - 1 : -1;
 
             // Set one perimeter when TopSurfaces is selected.
             if (only_one_wall_top && loop_number > 0)
@@ -2745,7 +2745,7 @@ void PerimeterGenerator::process_arachne()
             Polygons   last_p = to_polygons(last);
             // Orca: graded wall reinforcement walls the band instead of the island, see WallBand.hpp.
             std::optional<WallBandPaths> band = wall_band_paths(*this, surface, last, input_params_tmp);
-            if (band) { last_p = std::move(band->outline); loop_number = band->loop_number; input_params_tmp = band->params; }
+            if (band) { last_p = std::move(band->outline); loop_number = band->loop_number; input_params_tmp = band->params; inner_loop_number = -1; }
             Arachne::WallToolPaths wallToolPaths(last_p, bead_width_0, perimeter_spacing, coord_t(loop_number + 1),
                                                    wall_0_inset, layer_height, input_params_tmp);
             std::vector<Arachne::VariableWidthLines>   perimeters = wallToolPaths.getToolPaths();

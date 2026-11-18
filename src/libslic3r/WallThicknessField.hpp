@@ -37,7 +37,8 @@
 // The part and modifier meshes have to be closed and consistently oriented: whether a point is in
 // the zone is decided by winding numbers. A zone narrower than about w/2 may be missed.
 //
-// The field is built once per object and only read afterwards.
+// The field is built once per object and only queried afterwards; the one thing a query writes is the
+// note_skipped() flags.
 
 #include <atomic>
 #include <cstddef>

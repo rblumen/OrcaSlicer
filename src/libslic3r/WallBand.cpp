@@ -158,15 +158,14 @@ std::optional<WallBandPaths> wall_band_paths(const PerimeterGenerator &generator
                                           Vec3d(unscaled(extents.max.x()), unscaled(extents.max.y()), generator.slice_z + 0.5 * generator.layer_height))))
         return std::nullopt;
 
-    // Wall paths the band does not support yet, see WallBand.hpp. The one-wall options act only with the shell they
-    // apply to, as in PerimeterGenerator::process_arachne(). An island within reach of a zone that takes one keeps
-    // the stock walls, which the object reports.
+    // Wall paths the band does not support yet, see WallBand.hpp. Only one wall on top surfaces is not among them:
+    // the band wins, and process_arachne() skips the one-wall-top second pass for an island with a band. The
+    // options act only with the shell or infill they apply to, as in PerimeterGenerator::process_arachne(). An
+    // island within reach of a zone that takes one keeps the stock walls, which the object reports.
     unsigned skip = 0;
-    if (config.only_one_wall_top && config.top_shell_layers.value > 0)
-        skip |= wbsOnlyOneWallTop;
     if (config.only_one_wall_first_layer && config.bottom_shell_layers.value > 0 && generator.layer_id == generator.object_config->raft_layers)
         skip |= wbsOnlyOneWallFirstLayer;
-    if (config.alternate_extra_wall)
+    if (config.alternate_extra_wall && config.sparse_infill_density.value > 0)
         skip |= wbsAlternateExtraWall;
     if (config.detect_overhang_wall && config.extra_perimeters_on_overhangs)
         skip |= wbsExtraWallsOnOverhangs;

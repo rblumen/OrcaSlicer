@@ -33,7 +33,6 @@ std::shared_ptr<const WallThicknessField> build_wall_thickness_field(const Print
 
 // Why an island within reach of a zone takes the stock walls, as bits of WallThicknessField::skipped().
 enum WallBandSkip : unsigned {
-    wbsOnlyOneWallTop         = 1,
     wbsOnlyOneWallFirstLayer  = 2,
     wbsAlternateExtraWall     = 4,
     wbsExtraWallsOnOverhangs  = 8,
@@ -60,8 +59,8 @@ struct WallBandPaths
 
 // The band of one island of the generator's layer, `island` being the island as offset for the outer wall. None
 // if the generator has no thickness field, the field leaves the island at its base thickness, or the island
-// takes a wall path the band does not support yet (one wall on top or on the first layer, alternating extra
-// walls, extra walls on overhangs).
+// takes a wall path the band does not support yet (one wall on the first layer, alternating extra walls,
+// extra walls on overhangs). The band wins over one wall on top surfaces.
 std::optional<WallBandPaths> wall_band_paths(const PerimeterGenerator &generator, const Surface &surface, const ExPolygons &island,
                                              const Arachne::WallToolPathsParams &params);
 
