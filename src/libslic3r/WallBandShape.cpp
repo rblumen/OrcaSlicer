@@ -1,6 +1,8 @@
 #include "WallBandShape.hpp"
 
 #include "ClipperUtils.hpp"
+#include "Point.hpp"
+#include "ExPolygon.hpp"
 #include "Polygon.hpp"
 #include "libslic3r.h"
 
@@ -8,6 +10,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -17,10 +20,10 @@ namespace Slic3r {
 // the material for a CCW contour and for a CW hole. At a vertex, the mean of the two edge normals.
 static std::vector<Vec2d> vertex_normals(const Points &pts)
 {
-    auto edge_normal = [&pts](size_t i) {
+    auto edge_normal = [&pts](size_t i) -> Vec2d {
         const Vec2d v = (pts[(i + 1) % pts.size()] - pts[i]).cast<double>();
         const double l = v.norm();
-        return l > 0. ? Vec2d(v.y() / l, - v.x() / l) : Vec2d::Zero().eval();
+        return l > 0. ? Vec2d(v.y() / l, - v.x() / l) : Vec2d(Vec2d::Zero());
     };
     std::vector<Vec2d> out;
     out.reserve(pts.size());

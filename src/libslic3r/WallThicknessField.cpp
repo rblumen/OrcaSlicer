@@ -1,11 +1,14 @@
 #include "WallThicknessField.hpp"
 
+#include <Eigen/Core>
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <unordered_map>
 #include <utility>
@@ -16,6 +19,7 @@
 #include <igl/Hit.h>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
+#include <vector>
 
 #include "AABBTreeIndirect.hpp"
 #include "BoundingBox.hpp"
