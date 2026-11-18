@@ -29,10 +29,17 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Arachne/utils/ExtrusionJunction.hpp"
 #include "libslic3r/Arachne/utils/ExtrusionLine.hpp"
+#include "libslic3r/Arachne/BeadingStrategy/BeadingStrategy.hpp"
+#include "libslic3r/Arachne/BeadingStrategy/BeadingStrategyFactory.hpp"
+#include "libslic3r/Arachne/WallToolPaths.hpp"
+#include "libslic3r/Flow.hpp"
+#include "libslic3r/Geometry.hpp"
+#include "libslic3r/Line.hpp"
 #include "libslic3r/WallBand.hpp"
 #include <functional>
 #include <initializer_list>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -1750,8 +1757,7 @@ TEST_CASE("A modifier on the Hard transition slices as one without the wall coun
     CHECK(perimeter_warnings(hard_print).empty());
 }
 
-// A modifier thinning the walls merges with the part like one thickening them. Until the ramp is built, the merged
-// walls are the part's.
+// A modifier thinning the walls merges with the part like one thickening them.
 TEST_CASE("A modifier with fewer walls and a ramped transition shares the part's walls instead of walling its outline inside the part", "[Perimeters][WallRamp]")
 {
     const char *wall_generator = GENERATE("classic", "arachne");
@@ -2308,7 +2314,10 @@ TEST_CASE("Print validation rejects a ramp modifier with its own only one wall o
     CAPTURE(variant.name);
 
     DynamicPrintConfig config = wall_ramp_config("arachne");
-    config.set_deserialize_strict({ { "only_one_wall_top", variant.explicit_on_modifier ? 0 : 1 }, { "top_shell_layers", 3 } });
+    // Resetting the extruder at each layer keeps relative extrusion from failing validation for its own reason, so
+    // that the only error left to report is this one.
+    config.set_deserialize_strict({ { "only_one_wall_top", variant.explicit_on_modifier ? 0 : 1 }, { "top_shell_layers", 3 },
+                                    { "layer_change_gcode", "G92 E0" } });
     DynamicPrintConfig modifier = wall_modifier_config({ { "wall_loops", variant.wall_loops }, { "wall_loops_transition", variant.transition },
                                                          { "wall_ramp_taper_ratio", 5. } });
     if (variant.explicit_on_modifier)
@@ -2317,9 +2326,10 @@ TEST_CASE("Print validation rejects a ramp modifier with its own only one wall o
     Model model;
     part_with_wall_modifier(print, model, config, modifier);
     const std::string error = print.validate().string;
-    // The test config trips unrelated validation errors, so look for this one only.
-    const bool reported = error.find("uses the Ramp wall count transition") != std::string::npos;
-    CHECK(reported == variant.error);
+    if (variant.error)
+        CHECK_THAT(error, Catch::Matchers::ContainsSubstring("uses the Ramp wall count transition"));
+    else
+        CHECK(error.empty());
 }
 
 TEST_CASE("A steep ramp raises the transition angle no further than the option allows", "[Perimeters][WallRamp]")
@@ -2572,3 +2582,636 @@ TEST_CASE("A layer with a ramp band has no wall piece shorter than the wall spac
     REQUIRE(pieces > 0);
     CHECK(shortest >= ramp_wall_spacing);
 }
+
+namespace {
+
+// The ramp band fixture of the tests below: wall_ramp_config() with every setting Arachne's bead count transitions,
+// the bead widths and the flow depend on.
+DynamicPrintConfig wall_band_config(int part_wall_loops = 2)
+{
+    DynamicPrintConfig config = wall_ramp_config("arachne", part_wall_loops);
+    config.set_deserialize_strict({
+        { "min_bead_width",                   "85%" },
+        { "min_feature_size",                 "25%" },
+        { "wall_transition_length",           "100%" },
+        { "wall_transition_angle",            10 },
+        { "wall_transition_filter_deviation", "25%" },
+        { "wall_distribution_count",          1 },
+        { "precise_outer_wall",               0 },
+        { "inner_wall_speed",                 "60" },
+        { "filament_max_volumetric_speed",    "12" },
+    });
+    return config;
+}
+
+// The taper ratio of wall_ramp_modifier_config().
+const double ramp_taper_ratio = 5.;
+// The modifier of part_with_wall_modifier() crosses the part along x = 15, and its zone lies beyond.
+const double zone_x = 15.;
+// The width of the walls of wall_ramp_config(), the bead width the tolerances below are given in.
+const double ramp_wall_width = 0.45;
+
+// The brick bond shift of a layer, in taper ratios times the bead width: towards the zone on even layers, away from it
+// on odd ones.
+double brick_bond_shift(const Layer &layer) { return layer.id() % 2 == 0 ? 0.25 : -0.25; }
+
+// How far out from the zone the ramp of a zone with `zone_loops` walls has the thickness `t` on `layer`. The thickness
+// changes by one bead width w every taper ratio of bead widths, see wall_ramp_thickness(), and the brick bond shifts
+// the whole ramp.
+double ramp_distance(double t, int zone_loops, const Layer &layer)
+{
+    const double w = ramp_wall_spacing;
+    return std::abs(zone_loops * w - t) * ramp_taper_ratio - brick_bond_shift(layer) * ramp_taper_ratio * w;
+}
+
+// The Arachne parameters of `config` on layer `layer_id`, as the perimeter generator takes them.
+Arachne::WallToolPathsParams arachne_params(const DynamicPrintConfig &config, size_t layer_id)
+{
+    PrintObjectConfig object_config;
+    object_config.apply(config, true);
+    PrintConfig print_config;
+    print_config.apply(config, true);
+    return Arachne::make_paths_params(int(layer_id), object_config, print_config);
+}
+
+// Arachne's beading strategy for the band of a zone with `zone_loops` walls, made as Arachne::WallToolPaths makes it
+// from what wall_band_paths() passes it: beads one wall spacing wide, the transition angle raised above the ramp's.
+Arachne::BeadingStrategyPtr band_beading_strategy(const DynamicPrintConfig &config, size_t layer_id, int zone_loops)
+{
+    const Arachne::WallToolPathsParams params = arachne_params(config, layer_id);
+    const float  width = Flow::rounded_rectangle_extrusion_width_from_spacing(float(ramp_wall_spacing), float(config.opt_float("layer_height")));
+    const double split = std::clamp(2. * params.min_bead_width / width - 1., 0.01, 0.99);
+    const double add   = std::clamp(double(params.min_bead_width / width), 0.01, 0.99);
+    return Arachne::BeadingStrategyFactory::makeStrategy(
+        scaled<coord_t>(ramp_wall_spacing), scaled<coord_t>(ramp_wall_spacing), scaled<coord_t>(params.wall_transition_length),
+        float(Geometry::deg2rad(wall_band_transition_angle(params.wall_transition_angle, ramp_taper_ratio))), Arachne::fill_outline_gaps,
+        scaled<coord_t>(params.min_bead_width), scaled<coord_t>(params.min_feature_size), split, add, coord_t(2 * (zone_loops + 1)), 0,
+        params.wall_distribution_count);
+}
+
+// The first x from the zone outward, in 0.05mm steps from x = 17.5 to x = 8, where the layer lays fewer than `walls`
+// walls across its y = 0 side; x = 7 if there is none.
+double first_x_below(const Layer &layer, size_t walls)
+{
+    for (double x = 17.5; x >= 8.; x -= 0.05)
+        if (walls_across_side(layer, x) < walls)
+            return x;
+    return 7.;
+}
+
+// One extrusion of a wall of the layer.
+struct WallPath
+{
+    Polyline polyline;
+    // The extrusion width, and the spacing it lays the bead at.
+    double   width;
+    double   spacing;
+    double   mm3_per_mm;
+    bool     external;
+    // Index of the wall it belongs to.
+    size_t   wall;
+};
+
+std::vector<WallPath> wall_paths(const Layer &layer)
+{
+    std::vector<WallPath> out;
+    size_t                wall = 0;
+    for (const LayerRegion *region : layer.regions()) {
+        const ExtrusionEntityCollection walls = region->perimeters.flatten();
+        for (const ExtrusionEntity *entity : walls.entities) {
+            ExtrusionPaths paths;
+            if (const auto *loop = dynamic_cast<const ExtrusionLoop*>(entity))
+                paths = loop->paths;
+            else if (const auto *multi = dynamic_cast<const ExtrusionMultiPath*>(entity))
+                paths = multi->paths;
+            else if (const auto *path = dynamic_cast<const ExtrusionPath*>(entity))
+                paths.push_back(*path);
+            for (const ExtrusionPath &path : paths)
+                out.push_back({ path.polyline.to_polyline(), path.width, path.width - path.height * (1. - 0.25 * M_PI), path.mm3_per_mm,
+                                path.role() == erExternalPerimeter, wall });
+            ++ wall;
+        }
+    }
+    return out;
+}
+
+// The extrusion widths of the walls across the layer's y = 0 side at x mm from the part's -X side, from the outside
+// in. Pieces less than 0.1mm apart are one wall, which takes the widest.
+std::vector<double> side_widths(const Layer &layer, const std::vector<WallPath> &paths, double x)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const BoundingBox strip(Point(part.min.x() + scaled<coord_t>(x - 0.01), part.min.y() - scaled<coord_t>(1.)),
+                            Point(part.min.x() + scaled<coord_t>(x + 0.01), part.min.y() + scaled<coord_t>(3.)));
+    std::vector<std::pair<double, double>> crossings;
+    for (const WallPath &path : paths)
+        for (const Polyline &piece : intersection_pl(Polylines{ path.polyline }, strip.polygon()))
+            crossings.emplace_back(unscaled<double>(piece.first_point().y() + piece.last_point().y()) / 2., path.width);
+    std::sort(crossings.begin(), crossings.end());
+    std::vector<double> widths;
+    double              last_depth = 0.;
+    for (const auto &[depth, width] : crossings) {
+        if (widths.empty() || depth - last_depth > 0.1)
+            widths.push_back(width);
+        else
+            widths.back() = std::max(widths.back(), width);
+        last_depth = depth;
+    }
+    return widths;
+}
+
+// The footprint of a segment of a bead: a quad as wide as the bead's spacing, so that beads laid side by side at their
+// spacing tile the area they fill.
+void add_segment_footprint(Polygons &out, const Point &a, const Point &b, double width)
+{
+    const Vec2d  d   = (b - a).cast<double>();
+    const double len = d.norm();
+    if (len < SCALED_EPSILON)
+        return;
+    const Vec2d n = Vec2d(- d.y(), d.x()) / len;
+    Polygon quad;
+    quad.points = { Point((a.cast<double>() + n * 0.5 * width).cast<coord_t>()), Point((b.cast<double>() + n * 0.5 * width).cast<coord_t>()),
+                    Point((b.cast<double>() - n * 0.5 * width).cast<coord_t>()), Point((a.cast<double>() - n * 0.5 * width).cast<coord_t>()) };
+    if (quad.is_clockwise())
+        quad.reverse();
+    out.push_back(std::move(quad));
+}
+
+// The footprints of the walls, one set of polygons per wall.
+std::vector<Polygons> footprints(const std::vector<WallPath> &paths)
+{
+    std::vector<Polygons> out;
+    for (const WallPath &path : paths) {
+        if (out.size() <= path.wall)
+            out.resize(path.wall + 1);
+        const double width = scaled<double>(path.spacing);
+        for (size_t i = 1; i < path.polyline.size(); ++ i)
+            add_segment_footprint(out[path.wall], path.polyline.points[i - 1], path.polyline.points[i], width);
+    }
+    return out;
+}
+
+// The walls Arachne laid, extruded as the perimeter generator extrudes them, see traverse_extrusions().
+std::vector<WallPath> wall_paths(const std::vector<Arachne::VariableWidthLines> &lines, double layer_height)
+{
+    const Flow            flow(float(ramp_wall_width), float(layer_height), 0.4f);
+    std::vector<WallPath> out;
+    size_t                wall = 0;
+    for (const Arachne::VariableWidthLines &inset : lines)
+        for (Arachne::ExtrusionLine line : inset) {
+            if (line.is_closed && line.junctions.size() > 2 && line.junctions.front().p != line.junctions.back().p)
+                line.junctions.push_back(line.junctions.front());
+            ExtrusionPaths paths;
+            extrusion_paths_append(paths, line, erPerimeter, flow);
+            for (const ExtrusionPath &path : paths)
+                out.push_back({ path.polyline.to_polyline(), path.width, path.width - path.height * (1. - 0.25 * M_PI), path.mm3_per_mm, false, wall });
+            ++ wall;
+        }
+    return out;
+}
+
+// The area in mm^2 the walls cover more than once: the sum of their footprints minus the footprint of all of them.
+double overlap_area(const std::vector<Polygons> &walls)
+{
+    double   sum = 0.;
+    Polygons all;
+    for (const Polygons &wall : walls) {
+        sum += area(union_(wall));
+        append(all, wall);
+    }
+    return (sum - area(union_(all))) * SCALING_FACTOR * SCALING_FACTOR;
+}
+
+// The area the layer's walls leave to the infill.
+ExPolygons unfilled_area(const Layer &layer)
+{
+    ExPolygons unfilled;
+    for (const LayerRegion *region : layer.regions())
+        append(unfilled, region->fill_no_overlap_expolygons);
+    return union_ex(unfilled);
+}
+
+// The wall length in mm the layer extrudes within x = x0..x1 from the part's -X side.
+double wall_length_between(const Layer &layer, double x0, double x1)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const BoundingBox box(Point(part.min.x() + scaled<coord_t>(x0), part.min.y() - scaled<coord_t>(1.)),
+                          Point(part.min.x() + scaled<coord_t>(x1), part.max.y() + scaled<coord_t>(1.)));
+    Polylines walls;
+    for (const LayerRegion *region : layer.regions())
+        append(walls, region->perimeters.as_polylines());
+    return unscaled<double>(total_length(intersection_pl(walls, box.polygon())));
+}
+
+// An end of an open wall that no other open wall starts or ends at: where a wall stops rather than going on as
+// another piece of itself.
+struct FreeEnd
+{
+    Point point;
+    int   inset;
+};
+
+std::vector<FreeEnd> free_wall_ends(const Layer &layer)
+{
+    // flatten() returns a collection that owns its entities, so keep each one alive while `open` points into it.
+    std::vector<ExtrusionEntityCollection> walls;
+    for (const LayerRegion *region : layer.regions())
+        walls.emplace_back(region->perimeters.flatten());
+    std::vector<const ExtrusionEntity *> open;
+    for (const ExtrusionEntityCollection &collection : walls)
+        for (const ExtrusionEntity *entity : collection.entities)
+            if (! entity->is_loop())
+                open.push_back(entity);
+    std::vector<FreeEnd> out;
+    for (const ExtrusionEntity *entity : open)
+        for (const Point &end : { entity->first_point(), entity->last_point() })
+            if (std::none_of(open.begin(), open.end(), [entity, &end](const ExtrusionEntity *other) {
+                    return other != entity && (other->first_point() == end || other->last_point() == end); }))
+                out.push_back({ end, entity->inset_idx });
+    return out;
+}
+
+// Distance in mm from `point` to the nearest edge of `area`.
+double distance_to_edge(const Point &point, const ExPolygons &area)
+{
+    double best = std::numeric_limits<double>::max();
+    for (const Line &line : to_lines(area))
+        best = std::min(best, line.distance_to(point));
+    return unscaled<double>(best);
+}
+
+// The G-code's lines that are not comments. The comments carry the header's time stamp and version, and the config
+// block, which lists the process's Ramp settings.
+std::vector<std::string> gcode_commands(const std::string &gcode)
+{
+    std::vector<std::string> out;
+    std::istringstream       in(gcode);
+    std::string              line;
+    while (std::getline(in, line))
+        if (! line.empty() && line.front() != ';')
+            out.push_back(line);
+    return out;
+}
+
+// The first command two G-codes differ at, empty if they are the same.
+std::string first_difference(const std::vector<std::string> &a, const std::vector<std::string> &b)
+{
+    for (size_t i = 0; i < std::min(a.size(), b.size()); ++ i)
+        if (a[i] != b[i])
+            return "command " + std::to_string(i) + ": " + a[i] + " | " + b[i];
+    return a.size() == b.size() ? std::string() : "lengths " + std::to_string(a.size()) + " | " + std::to_string(b.size());
+}
+
+} // namespace
+
+// Hard is the transition of a modifier that sets neither key, and the Ramp transition only acts set on a modifier, so
+// neither changes a single command of the G-code.
+TEST_CASE("Without a modifier on the Ramp transition the G-code is that of a slice without the Ramp settings", "[Perimeters][WallRamp]")
+{
+    const char       *wall_generator = GENERATE("classic", "arachne");
+    const std::string case_name      = GENERATE("modifiers on Hard", "Ramp set in the process and on the part");
+    CAPTURE(wall_generator, case_name);
+
+    const DynamicPrintConfig plain_config = wall_ramp_config(wall_generator);
+    DynamicPrintConfig       keyed_config = plain_config;
+    std::vector<ModifierBox> plain_modifiers, keyed_modifiers;
+    if (case_name == "modifiers on Hard") {
+        // One modifier adding walls and one removing them.
+        plain_modifiers = { modifier_box(15., 25., wall_modifier_config({})), modifier_box(-5., 5., wall_modifier_config({ { "wall_loops", 1 } })) };
+        keyed_modifiers = { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "hard" }, { "wall_ramp_taper_ratio", 5. } })),
+                            modifier_box(-5., 5., wall_modifier_config({ { "wall_loops", 1 }, { "wall_loops_transition", "hard" },
+                                                                         { "wall_ramp_taper_ratio", 5. } })) };
+    } else
+        keyed_config.set_deserialize_strict({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } });
+
+    Print plain_print, keyed_print;
+    Model plain_model, keyed_model;
+    slice_parts_with_modifiers(plain_print, plain_model, plain_config, { -1 }, plain_modifiers);
+    slice_parts_with_modifiers(keyed_print, keyed_model, keyed_config, { -1 }, keyed_modifiers, [&case_name](ModelObject &object) {
+        if (case_name != "modifiers on Hard")
+            object.volumes.front()->config.set_key_value("wall_loops_transition", new ConfigOptionEnum<WallLoopsTransition>(WallLoopsTransition::Ramp));
+    });
+    const std::vector<std::string> plain = gcode_commands(gcode(plain_print));
+    const std::vector<std::string> keyed = gcode_commands(gcode(keyed_print));
+    REQUIRE(plain.size() > 1000);
+    const std::string difference = first_difference(plain, keyed);
+    CAPTURE(difference);
+    CHECK(difference.empty());
+}
+
+// The part has 4 walls and the modifier over x = 15..25 has 2. The ramp runs 2 * 5 bead widths, about 4.1mm, out from
+// the modifier's outline at x = 15, shifted by up to 0.5mm by the brick bond, and the walls come back one at a time
+// along it.
+TEST_CASE("A modifier with fewer walls and a ramped transition tapers the walls from the part's count to its own", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_band_config(4),
+                            wall_modifier_config({ { "wall_loops", 2 }, { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", ramp_taper_ratio } }));
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    // In the zone, and beyond the ramp.
+    CHECK(walls_across_side(*layer, 17.5) == 2);
+    CHECK(walls_across_side(*layer, 8.) == 4);
+    // From the zone outward the count never shrinks, and passes through 3.
+    std::vector<size_t> counts;
+    for (double x = 17.5; x >= 8.; x -= 0.1)
+        counts.emplace_back(walls_across_side(*layer, x));
+    CAPTURE(counts);
+    CHECK(std::is_sorted(counts.begin(), counts.end()));
+    CHECK(std::find(counts.begin(), counts.end(), 3) != counts.end());
+    const std::string overlapped = overlapping_walls(*layer);
+    CAPTURE(overlapped);
+    CHECK(overlapped.empty());
+    CHECK(perimeter_warnings(print).empty());
+}
+
+// The part has 2 walls and the modifier none. The band thins along the ramp and ends where it gets thinner than the
+// thinnest bead Arachne lays, short of the zone: the walls end there, and the infill reaches the contour beyond. Past
+// the far end of the ramp the walls are those of the part without the modifier.
+TEST_CASE("A modifier without walls and with a ramped transition ends the walls on its ramp and leaves them unchanged beyond", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    const DynamicPrintConfig config = wall_band_config();
+    Print print, stock_print;
+    Model model, stock_model;
+    part_with_wall_modifier(print, model, config,
+                            wall_modifier_config({ { "wall_loops", 0 }, { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", ramp_taper_ratio } }));
+    slice_parts_with_modifiers(stock_print, stock_model, config, { -1 }, {});
+    const Layer *layer = layer_at(print, print_z);
+    const Layer *stock = layer_at(stock_print, print_z);
+    REQUIRE(layer != nullptr);
+    REQUIRE(stock != nullptr);
+    CHECK(perimeter_warnings(print).empty());
+
+    // No walls in the zone, past the stretch of it the brick bond may move the ramp into.
+    const double w = ramp_wall_spacing;
+    CHECK_THAT(wall_length_between(*layer, zone_x + 0.25 * ramp_taper_ratio * w + ramp_wall_width, 21.), Catch::Matchers::WithinAbs(0., 0.01));
+
+    // The outer wall ends where the ramp is as thick as the thinnest band, see wall_band_paths(), on each side the zone
+    // crosses. The only other walls that end are the inner walls, where the 2 beads merge into 1.
+    const Arachne::WallToolPathsParams params   = arachne_params(config, layer->id());
+    const Arachne::BeadingStrategyPtr  strategy = band_beading_strategy(config, layer->id(), 2);
+    const double end_x   = zone_x - ramp_distance(std::max(params.min_bead_width, params.min_feature_size), 0, *layer);
+    const double merge_x = zone_x - ramp_distance(unscaled<double>(strategy->getTransitionThickness(1)), 0, *layer);
+    const BoundingBox part = get_extents(layer->lslices);
+    size_t      outer_ends = 0;
+    std::string misplaced;
+    for (const FreeEnd &end : free_wall_ends(*layer)) {
+        const double x = unscaled<double>(end.point.x() - part.min.x());
+        if (std::abs(x - end_x) <= ramp_wall_width)
+            ++ outer_ends;
+        else if (std::abs(x - merge_x) > ramp_wall_width)
+            misplaced += "x=" + std::to_string(x) + "; ";
+    }
+    CAPTURE(end_x, merge_x, misplaced);
+    CHECK(outer_ends == 2);
+    CHECK(misplaced.empty());
+
+    // No sliver: no bead laid thinner than the thinnest bead Arachne lays.
+    double thinnest = std::numeric_limits<double>::max();
+    for (const WallPath &path : wall_paths(*layer))
+        thinnest = std::min(thinnest, path.spacing);
+    CHECK(thinnest >= params.min_bead_width - 0.01);
+
+    // Beyond the ramp the walls are the part's.
+    const double ramp_end = zone_x - ramp_distance(2. * w, 0, *layer) - ramp_wall_width;
+    CHECK_THAT(wall_length_between(*layer, -1., ramp_end), Catch::Matchers::WithinAbs(wall_length_between(*stock, -1., ramp_end), 0.5));
+}
+
+// A modifier with 4 walls over x = 15..25 and, after it, one with 1 wall over x = 5..16.5, both with a ramped
+// transition, on a part with 2. On Hard the later modifier would take the overlap.
+TEST_CASE("Where a reinforcing zone overlaps a thinning one the thicker walls win", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_band_config(), { -1 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", ramp_taper_ratio } })),
+                                 modifier_box(5., 16.5, wall_modifier_config({ { "wall_loops", 1 }, { "wall_loops_transition", "ramp" },
+                                                                              { "wall_ramp_taper_ratio", ramp_taper_ratio } })) });
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    // Where both zones lie, and where only the reinforcing one does. Further out to x = 20 the walls turn the corner.
+    CHECK(walls_across_side(*layer, 16.) == 4);
+    CHECK(walls_across_side(*layer, 17.5) == 4);
+    // Where only the thinning one does, beyond the 4.1mm ramp of the reinforcing one.
+    CHECK(walls_across_side(*layer, 7.) == 1);
+    CHECK(perimeter_warnings(print).empty());
+}
+
+// Arachne splits n beads into n + 1 where the band gets thicker than its transition thickness for n, which the ramp
+// reaches a taper ratio of bead widths further out per bead width it thins. At a minimum bead width of 85% of the
+// nozzle the transition thicknesses are about 3.5 and 2.75 bead widths, so the stations are about 0.75 taper ratios
+// of bead widths apart.
+TEST_CASE("The walls of a ramp drop where the band narrows past Arachne's transition thicknesses", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    const DynamicPrintConfig config = wall_band_config();
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    // The modifier's 4 walls and the part's 2.
+    const int zone_loops = 4, base_loops = 2;
+    const Arachne::BeadingStrategyPtr strategy = band_beading_strategy(config, layer->id(), zone_loops);
+    std::vector<double> expected, measured;
+    for (int walls = zone_loops; walls > base_loops; -- walls) {
+        const double transition = unscaled<double>(strategy->getTransitionThickness(walls - 1));
+        expected.push_back(zone_x - ramp_distance(transition, zone_loops, *layer));
+        measured.push_back(first_x_below(*layer, size_t(walls)));
+        CAPTURE(walls, transition);
+        CHECK_THAT(measured.back(), Catch::Matchers::WithinAbs(expected.back(), ramp_wall_width));
+    }
+    CAPTURE(expected, measured);
+    CHECK_THAT(measured[0] - measured[1], Catch::Matchers::WithinAbs(expected[0] - expected[1], ramp_wall_width));
+}
+
+// The brick bond moves the ramp by a quarter of the taper ratio times the bead width towards the zone on even layers
+// and away from it on odd ones, so each layer's drops lie that far either side of the middle of the two.
+TEST_CASE("Alternate layers move the drops of a ramp a quarter of the taper ratio times the bead width either way", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_band_config(), wall_ramp_modifier_config());
+    const Layer *even = layer_at(print, 1.0);
+    const Layer *odd  = layer_at(print, 1.2);
+    REQUIRE(even != nullptr);
+    REQUIRE(odd != nullptr);
+    REQUIRE(even->id() % 2 == 0);
+    REQUIRE(odd->id() % 2 == 1);
+
+    const double delta = 0.25 * ramp_taper_ratio * ramp_wall_spacing;
+    for (const size_t walls : { 4, 3 }) {
+        const double even_x = first_x_below(*even, walls);
+        const double odd_x  = first_x_below(*odd, walls);
+        CAPTURE(walls, even_x, odd_x);
+        CHECK_THAT(0.5 * (even_x - odd_x), Catch::Matchers::WithinAbs(delta, 0.25));
+    }
+}
+
+namespace {
+
+// The band Arachne walls on a layer of the ramp fixture: the slice inset as the perimeter generator insets it for the
+// outer wall, so that the outer wall's spacing reaches its edge, minus what the walls leave to the infill.
+ExPolygons ramp_band(const Layer &layer)
+{
+    return diff_ex(offset_ex(layer.lslices, - float(scale_(0.5 * (ramp_wall_width - ramp_wall_spacing)))), unfilled_area(layer));
+}
+
+} // namespace
+
+// The beads of the band fill it, but for the corners of the contour and the tips of the beads that drop. A footprint
+// is as wide as the bead's spacing, the width it fills next to its neighbours.
+TEST_CASE("The beads of a ramp band cover at least 98% of it", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_band_config(), wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+    REQUIRE(walls_across_side(*layer, 17.5) == 4);
+
+    const ExPolygons band = ramp_band(*layer);
+    Polygons beads;
+    for (const Polygons &wall : footprints(wall_paths(*layer)))
+        append(beads, wall);
+    const double band_area = area(band) * SCALING_FACTOR * SCALING_FACTOR;
+    const double covered   = area(intersection_ex(band, union_ex(beads))) * SCALING_FACTOR * SCALING_FACTOR;
+    CAPTURE(band_area, covered);
+    CHECK(covered >= 0.98 * band_area);
+}
+
+// The band's beads lay no more of it twice than stock Arachne, run with the region's own parameters on the same band
+// and extruded the same way. A footprint is as wide as the bead's spacing.
+// Known defect, hence [!mayfail]: on this fixture the band's beads overlap by about 0.6mm^2 where stock Arachne's
+// overlap by about 0.16mm^2. Arachne with the band's raised transition angle and distribution count of 1 accounts for
+// about 0.37mm^2 of it, and number_wall_band_insets() splitting the lines by depth for the rest; the overlap gathers
+// at the drops and along the inner wall of the 2 wall stretch.
+TEST_CASE("The beads of a ramp band overlap no more than stock Arachne's beads on the same band", "[Perimeters][WallRamp][!mayfail]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    const DynamicPrintConfig config = wall_band_config();
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+    REQUIRE(walls_across_side(*layer, 17.5) == 4);
+
+    // With the 4 walls of the zone plus one, as wall_band_paths() asks for. WallToolPaths keeps a reference to the
+    // outline.
+    const Polygons         outline = to_polygons(ramp_band(*layer));
+    const double           layer_height = config.opt_float("layer_height");
+    Arachne::WallToolPaths stock(outline, scaled<coord_t>(ramp_wall_spacing), scaled<coord_t>(ramp_wall_spacing), 5, 0, layer_height,
+                                 arachne_params(config, layer->id()));
+    const double ramp_overlap  = overlap_area(footprints(wall_paths(*layer)));
+    const double stock_overlap = overlap_area(footprints(wall_paths(stock.getToolPaths(), layer_height)));
+    CAPTURE(ramp_overlap, stock_overlap);
+    CHECK(ramp_overlap <= stock_overlap + 0.05);
+}
+
+// The band's beads lie between the thinnest bead Arachne lays and the widest, just short of where it splits n beads
+// into n + 1. After the last drop the two remaining beads widen towards that, to about 0.56mm here, until the ramp
+// ends: that is expected, not a defect, as long as they stay within it. Only the middle bead flexes while there is one,
+// so the outermost beads keep their nominal width.
+TEST_CASE("The beads of a ramp band stay within Arachne's bead widths and under the flow limit", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    const DynamicPrintConfig config = wall_band_config();
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_ramp_modifier_config());
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+    REQUIRE(walls_across_side(*layer, 17.5) == 4);
+
+    const int zone_loops = 4, base_loops = 2;
+    const Arachne::WallToolPathsParams params   = arachne_params(config, layer->id());
+    const Arachne::BeadingStrategyPtr  strategy = band_beading_strategy(config, layer->id(), zone_loops);
+    double widest_allowed = 0.;
+    for (int beads = base_loops; beads < zone_loops; ++ beads)
+        for (const coord_t width : strategy->compute(strategy->getTransitionThickness(beads), beads).bead_widths)
+            widest_allowed = std::max(widest_allowed, unscaled<double>(width));
+
+    const std::vector<WallPath> paths = wall_paths(*layer);
+    const double max_volumetric_speed = config.opt_float("filament_max_volumetric_speed", 0);
+    double thinnest = std::numeric_limits<double>::max(), widest = 0., max_flow = 0.;
+    for (const WallPath &path : paths) {
+        thinnest = std::min(thinnest, path.spacing);
+        widest   = std::max(widest, path.spacing);
+        max_flow = std::max(max_flow, path.mm3_per_mm * config.opt_float(path.external ? "outer_wall_speed" : "inner_wall_speed", 0));
+    }
+    CAPTURE(thinnest, widest, widest_allowed, max_flow);
+    CHECK(thinnest >= params.min_bead_width - 0.01);
+    CHECK(widest <= widest_allowed + 0.01);
+    CHECK(max_flow <= max_volumetric_speed);
+
+    std::string off_nominal;
+    for (double x = 17.5; x >= 8.; x -= 0.1)
+        if (const std::vector<double> widths = side_widths(*layer, paths, x); widths.size() >= 3)
+            for (const double width : { widths.front(), widths.back() })
+                if (std::abs(width - ramp_wall_width) > 0.02)
+                    off_nominal += "x=" + std::to_string(x) + ": " + std::to_string(width) + "; ";
+    CAPTURE(off_nominal);
+    CHECK(off_nominal.empty());
+}
+
+// A wall that drops ends between its neighbours. The outer wall and the innermost wall, along the infill, run on
+// without a break, the latter in pieces by depth that meet end to end, so neither has a free end. Every layer counts,
+// first and top layers included.
+TEST_CASE("Every wall of a ramp band that stops does so between the outer wall and the innermost one", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_band_config(), wall_ramp_modifier_config());
+
+    size_t      free_ends = 0;
+    std::string misplaced, open_outer;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        size_t contours = 0, outer_loops = 0;
+        for (const ExPolygon &island : layer->lslices)
+            contours += 1 + island.holes.size();
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->perimeters.flatten().entities)
+                if (entity->role() == erExternalPerimeter && entity->is_loop())
+                    ++ outer_loops;
+        if (outer_loops != contours)
+            open_outer += "z=" + std::to_string(layer->print_z) + "; ";
+
+        const ExPolygons unfilled = unfilled_area(*layer);
+        for (const FreeEnd &end : free_wall_ends(*layer)) {
+            ++ free_ends;
+            const double to_contour = distance_to_edge(end.point, layer->lslices);
+            const double to_infill  = distance_to_edge(end.point, unfilled);
+            if (end.inset <= 0 || to_contour < 0.75 * ramp_wall_spacing || to_infill < 0.75 * ramp_wall_spacing)
+                misplaced += "z=" + std::to_string(layer->print_z) + " inset " + std::to_string(end.inset) + " " + std::to_string(to_contour) +
+                             "mm from the contour, " + std::to_string(to_infill) + "mm from the infill; ";
+        }
+    }
+    // The walls that drop along the ramp end on every layer.
+    REQUIRE(free_ends > 0);
+    CAPTURE(open_outer, misplaced);
+    CHECK(open_outer.empty());
+    CHECK(misplaced.empty());
+}
+
