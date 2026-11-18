@@ -424,12 +424,30 @@ void number_wall_band_insets(std::vector<Arachne::VariableWidthLines> &perimeter
                 // when it follows a hole, see Arachne::ExtrusionLine::is_contour(), as most of its junctions do.
                 junctions = std::move(pieces.front().junctions);
                 if (line.is_closed) {
-                    size_t       on_contour_count = 0, sampled = 0;
-                    const size_t step = std::max<size_t>(1, junctions.size() / 32);
-                    for (size_t i = 0; i < junctions.size(); i += step, ++ sampled)
+                    // Each sampled junction votes with the length of wall around it, so that a short stretch of many
+                    // junctions along a faceted hole does not outvote long straight sides. The closing junction repeats
+                    // the first and is left out.
+                    const size_t        count = junctions.size() - 1;
+                    std::vector<double> cumulative(count + 1, 0.);
+                    for (size_t i = 0; i < count; ++ i)
+                        cumulative[i + 1] = cumulative[i] + (junctions[i + 1].p - junctions[i].p).cast<double>().norm();
+                    const size_t        step = std::max<size_t>(1, count / 32);
+                    std::vector<size_t> sampled;
+                    for (size_t i = 0; i < count; i += step)
+                        sampled.push_back(i);
+                    double on_contour_length = 0., total_length = 0.;
+                    for (size_t k = 0; k < sampled.size(); ++ k) {
+                        const size_t i     = sampled[k];
+                        const size_t after = sampled[(k + 1) % sampled.size()];
+                        const size_t before = sampled[(k + sampled.size() - 1) % sampled.size()];
+                        const double to_next = after > i ? cumulative[after] - cumulative[i] : cumulative[count] - cumulative[i] + cumulative[after];
+                        const double from_prev = i > before ? cumulative[i] - cumulative[before] : cumulative[count] - cumulative[before] + cumulative[i];
+                        const double weight = 0.5 * (to_next + from_prev);
+                        total_length += weight;
                         if (on_contour[std::get<1>(outline.distance_from_lines_extra<false>(junctions[i].p))])
-                            ++ on_contour_count;
-                    if (line.is_contour() != (2 * on_contour_count >= sampled))
+                            on_contour_length += weight;
+                    }
+                    if (line.is_contour() != (2. * on_contour_length >= total_length))
                         std::reverse(junctions.begin(), junctions.end());
                 }
                 add(std::move(line), pieces.front().inset);

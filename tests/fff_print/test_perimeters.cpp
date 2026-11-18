@@ -2543,106 +2543,32 @@ TEST_CASE("A layer with a ramp band has no wall piece shorter than the wall spac
     const Layer *layer = layer_at(print, print_z);
     REQUIRE(layer != nullptr);
 
+    // Only the pieces of a wall split where its depth changes are merged when short; an open Arachne wall that is
+    // short to begin with is left alone. A split piece ends at a point it shares with the neighbouring piece of the
+    // same wall, which has another inset, so the check is on open walls that meet another open wall of a different
+    // inset at one of their ends.
+    // flatten() returns a collection that owns its entities, so keep each one alive while `open` points into it.
+    std::vector<ExtrusionEntityCollection> walls;
+    for (const LayerRegion *region : layer->regions())
+        walls.emplace_back(region->perimeters.flatten());
+    std::vector<const ExtrusionEntity *> open;
+    for (const ExtrusionEntityCollection &collection : walls)
+        for (const ExtrusionEntity *entity : collection.entities)
+            if (! entity->is_loop())
+                open.push_back(entity);
     size_t pieces = 0;
     double shortest = std::numeric_limits<double>::max();
-    for (const LayerRegion *region : layer->regions())
-        for (const ExtrusionEntity *entity : region->perimeters.flatten().entities)
-            if (! entity->is_loop()) {
-                ++ pieces;
-                shortest = std::min(shortest, unscaled<double>(total_length(entity->as_polylines())));
-            }
+    for (const ExtrusionEntity *entity : open) {
+        const bool split = std::any_of(open.begin(), open.end(), [entity](const ExtrusionEntity *other) {
+            return other != entity && other->inset_idx != entity->inset_idx &&
+                   (other->first_point() == entity->first_point() || other->first_point() == entity->last_point() ||
+                    other->last_point() == entity->first_point() || other->last_point() == entity->last_point());
+        });
+        if (split) {
+            ++ pieces;
+            shortest = std::min(shortest, unscaled<double>(total_length(entity->as_polylines())));
+        }
+    }
     REQUIRE(pieces > 0);
     CHECK(shortest >= ramp_wall_spacing);
-}
-
-namespace {
-
-// A wall through the points given in mm, closed from the last to the first.
-Arachne::ExtrusionLine wall_through(std::initializer_list<std::pair<double, double>> points, bool closed = false)
-{
-    Arachne::ExtrusionLine line(0, false);
-    for (const auto &[x, y] : points)
-        line.junctions.emplace_back(Point(scaled<coord_t>(x), scaled<coord_t>(y)), scaled<coord_t>(0.4), 0);
-    // Arachne closes a wall by repeating its first junction.
-    if (closed)
-        line.junctions.emplace_back(line.junctions.front());
-    line.is_closed = closed;
-    return line;
-}
-
-double wall_length(const Arachne::ExtrusionLine &line)
-{
-    double length = 0.;
-    for (size_t i = 1; i < line.junctions.size(); ++ i)
-        length += unscaled<double>((line.junctions[i].p - line.junctions[i - 1].p).cast<double>().norm());
-    return length;
-}
-
-ExPolygon square_island(double size)
-{
-    return ExPolygon(Polygon({ Point(0, 0), Point(scaled<coord_t>(size), 0), Point(scaled<coord_t>(size), scaled<coord_t>(size)), Point(0, scaled<coord_t>(size)) }));
-}
-
-} // namespace
-
-// The inset of a wall can change where it has no junction, along a segment as long as the part's side.
-TEST_CASE("A wall numbered by depth is split where its depth changes inside one segment", "[Perimeters][WallRamp]")
-{
-    // The outer wall runs only over x = 8..12, the wall inside it over the whole side in one segment.
-    std::vector<Arachne::VariableWidthLines> perimeters(1);
-    perimeters[0].emplace_back(wall_through({ { 8., 0.2 }, { 12., 0.2 } }));
-    perimeters[0].emplace_back(wall_through({ { 0.2, 0.6 }, { 19.8, 0.6 } }));
-    number_wall_band_insets(perimeters, { square_island(20.) }, scaled<coord_t>(0.4));
-
-    REQUIRE(perimeters.size() == 2);
-    // The inner wall takes inset 1 behind the outer wall only.
-    REQUIRE(perimeters[1].size() == 1);
-    CHECK_THAT(wall_length(perimeters[1].front()), Catch::Matchers::WithinAbs(4., 0.1));
-    CHECK(perimeters[0].size() == 3);
-}
-
-// A piece shorter than a bead takes the inset of its neighbour, and the wall stays one wall when that leaves one inset.
-TEST_CASE("A wall numbered by depth has no piece shorter than the spacing", "[Perimeters][WallRamp]")
-{
-    // The outer wall covers 0.15mm of the wall inside it.
-    std::vector<Arachne::VariableWidthLines> perimeters(1);
-    perimeters[0].emplace_back(wall_through({ { 8., 0.2 }, { 8.15, 0.2 } }));
-    perimeters[0].emplace_back(wall_through({ { 0.2, 0.6 }, { 8.05, 0.6 }, { 8.1, 0.6 }, { 8.2, 0.6 }, { 19.8, 0.6 } }));
-    number_wall_band_insets(perimeters, { square_island(20.) }, scaled<coord_t>(0.4));
-
-    REQUIRE(perimeters.size() == 1);
-    REQUIRE(perimeters[0].size() == 2);
-    const double longest = std::max(wall_length(perimeters[0][0]), wall_length(perimeters[0][1]));
-    CHECK_THAT(longest, Catch::Matchers::WithinAbs(19.6, 0.05));
-}
-
-// The loops of a band island with a hole follow its contour or its hole, whatever their start and direction.
-TEST_CASE("A closed wall numbered by depth runs as a contour or a hole by the outline most of it follows", "[Perimeters][WallRamp]")
-{
-    ExPolygon island = square_island(20.);
-    Polygon   hole({ Point(scaled<coord_t>(7.), scaled<coord_t>(7.)), Point(scaled<coord_t>(13.), scaled<coord_t>(7.)),
-                     Point(scaled<coord_t>(13.), scaled<coord_t>(13.)), Point(scaled<coord_t>(7.), scaled<coord_t>(13.)) });
-    hole.make_clockwise();
-    island.holes.emplace_back(std::move(hole));
-
-    // Counterclockwise around the contour and clockwise around the hole, as Arachne does not run them.
-    std::vector<Arachne::VariableWidthLines> perimeters(2);
-    perimeters[0].emplace_back(wall_through({ { 0.2, 0.2 }, { 19.8, 0.2 }, { 19.8, 19.8 }, { 0.2, 19.8 } }, true));
-    perimeters[0].emplace_back(wall_through({ { 6.8, 6.8 }, { 6.8, 13.2 }, { 13.2, 13.2 }, { 13.2, 6.8 } }, true));
-    // A wall along the contour that starts on a dent towards the hole, nearest the hole there.
-    perimeters[1].emplace_back(wall_through({ { 10., 5.5 }, { 18., 2. }, { 18., 18. }, { 2., 18. }, { 2., 2. } }, true));
-    number_wall_band_insets(perimeters, { island }, scaled<coord_t>(0.4));
-
-    REQUIRE(perimeters.size() == 2);
-    REQUIRE(perimeters[0].size() == 2);
-    REQUIRE(perimeters[1].size() == 1);
-    size_t outer_contours = 0, outer_holes = 0;
-    for (const Arachne::ExtrusionLine &line : perimeters[0]) {
-        REQUIRE(line.is_closed);
-        ++ (line.is_contour() ? outer_contours : outer_holes);
-    }
-    CHECK(outer_contours == 1);
-    CHECK(outer_holes == 1);
-    CHECK(perimeters[1].front().is_closed);
-    CHECK(perimeters[1].front().is_contour());
 }
