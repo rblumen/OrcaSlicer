@@ -30,6 +30,8 @@
 #include "Tesselate.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "Utils.hpp"
+#include "WallBand.hpp"
+#include "WallThicknessField.hpp"
 #include "Fill/FillAdaptive.hpp"
 #include "Fill/Fill.hpp"
 #include "Fill/FillLightning.hpp"
@@ -657,13 +659,17 @@ void PrintObject::make_perimeters()
         BOOST_LOG_TRIVIAL(debug) << "Generating extra perimeters for region " << region_id << " in parallel - end";
     }
 
+    // Orca: the walls of modifiers with a ramped transition follow the object's thickness field, see WallBand.hpp.
+    const std::shared_ptr<const WallThicknessField> wall_thickness_field = build_wall_thickness_field(*this);
+    m_print->throw_if_canceled();
+
     BOOST_LOG_TRIVIAL(debug) << "Generating perimeters in parallel - start";
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, m_layers.size()),
-        [this](const tbb::blocked_range<size_t>& range) {
+        [this, &wall_thickness_field](const tbb::blocked_range<size_t>& range) {
             for (size_t layer_idx = range.begin(); layer_idx < range.end(); ++ layer_idx) {
                 m_print->throw_if_canceled();
-                m_layers[layer_idx]->make_perimeters();
+                m_layers[layer_idx]->make_perimeters(wall_thickness_field.get());
             }
         }
     );

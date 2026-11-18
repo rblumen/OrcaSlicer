@@ -154,6 +154,10 @@ public:
     // max(N0, N1) * w. The caller's default applies elsewhere.
     double min_thickness() const;
     double max_thickness() const;
+    // w, the bead width the thicknesses are multiples of, in mm.
+    double bead_width() const;
+    // The smallest taper ratio rho of the active zones, which gives the steepest ramp.
+    double min_taper_ratio() const;
     // Triangles of the remeshed surfaces of all zones, for diagnostics.
     size_t triangle_count() const;
 

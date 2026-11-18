@@ -2102,3 +2102,48 @@ TEST_CASE("A fuzzy skin painted copy of a modifier region with a ramped transiti
     // The modifier's region and its fuzzy skin copy.
     CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2, 2 });
 }
+
+namespace {
+
+// Number of walls the layer lays across its y = 0 side at x mm from the part's -X side: the pieces of its walls within
+// a 0.02mm wide strip there, running from 1mm outside the side to 3mm inside it.
+size_t walls_across_side(const Layer &layer, double x)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const BoundingBox strip(Point(part.min.x() + scaled<coord_t>(x - 0.01), part.min.y() - scaled<coord_t>(1.)),
+                            Point(part.min.x() + scaled<coord_t>(x + 0.01), part.min.y() + scaled<coord_t>(3.)));
+    Polylines walls;
+    for (const LayerRegion *region : layer.regions())
+        append(walls, region->perimeters.as_polylines());
+    return intersection_pl(walls, strip.polygon()).size();
+}
+
+} // namespace
+
+// The part has 2 walls and the modifier over x = 15..25 has 4. With a taper ratio of 5 the ramp runs 2 * 5 bead widths,
+// about 4.1mm at the 0.41mm spacing of 0.45mm walls 0.2mm high, out from the modifier's outline at x = 15, shifted by a
+// quarter of a drop spacing either way on alternate layers. The walls drop one at a time along it.
+TEST_CASE("A modifier with more walls and a ramped transition tapers the walls from its count to the part's", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("arachne"),
+                            wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } }));
+    const Layer *layer = layer_at(print, print_z);
+    REQUIRE(layer != nullptr);
+
+    // In the zone, and beyond the ramp.
+    CHECK(walls_across_side(*layer, 17.5) == 4);
+    CHECK(walls_across_side(*layer, 8.) == 2);
+    // From the zone outward the count never grows, and passes through 3.
+    std::vector<size_t> counts;
+    for (double x = 17.5; x >= 8.; x -= 0.1)
+        counts.emplace_back(walls_across_side(*layer, x));
+    CAPTURE(counts);
+    CHECK(std::is_sorted(counts.rbegin(), counts.rend()));
+    CHECK(std::find(counts.begin(), counts.end(), 3) != counts.end());
+    CHECK(perimeter_warnings(print).empty());
+}

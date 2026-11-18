@@ -382,7 +382,7 @@ static void remove_extrusions_over(ExtrusionEntityCollection &collection, const 
 // Here the perimeters are created cummulatively for all layer regions sharing the same parameters influencing the perimeters.
 // The perimeter paths and the thin fills (ExtrusionEntityCollection) are assigned to the first compatible layer region.
 // The resulting fill surface is split back among the originating regions.
-void Layer::make_perimeters()
+void Layer::make_perimeters(const WallThicknessField *wall_thickness_field)
 {
     BOOST_LOG_TRIVIAL(trace) << "Generating perimeters for layer " << this->id();
 
@@ -442,7 +442,7 @@ void Layer::make_perimeters()
 	        clipped = union_ex(clipped);
 	        if (layerms.size() == 1 && clipped.empty()) {  // optimization
 	            (*layerm)->fill_surfaces.surfaces.clear();
-                (*layerm)->make_perimeters((*layerm)->slices, {*layerm}, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons);
+                (*layerm)->make_perimeters((*layerm)->slices, {*layerm}, &(*layerm)->fill_surfaces, &(*layerm)->fill_no_overlap_expolygons, wall_thickness_field);
 	            (*layerm)->fill_expolygons = to_expolygons((*layerm)->fill_surfaces.surfaces);
 	        } else {
 	            // Orca: Unlike the compatible regions above, the initiating region has not
@@ -478,7 +478,7 @@ void Layer::make_perimeters()
 	            SurfaceCollection fill_surfaces;
                 //BBS
                 ExPolygons fill_no_overlap;
-	            layerm_config->make_perimeters(new_slices, layerms, &fill_surfaces, &fill_no_overlap);
+	            layerm_config->make_perimeters(new_slices, layerms, &fill_surfaces, &fill_no_overlap, wall_thickness_field);
 	            if (! clipped.empty()) {
 	                // The fill there is dropped below, with the fill outside the slices of these regions.
 	                remove_extrusions_over(layerm_config->perimeters, to_polygons(clipped));

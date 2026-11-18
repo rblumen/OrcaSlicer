@@ -17,6 +17,7 @@
 #include "Surface.hpp"
 #include "VariableWidth.hpp"
 #include "Arachne/WallToolPaths.hpp"
+#include "WallBand.hpp"
 #include "Geometry/ConvexHull.hpp"
 #include "ExPolygonCollection.hpp"
 #include "Geometry.hpp"
@@ -28,6 +29,7 @@
 #include <limits>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <tuple>
 #include <unordered_set>
@@ -2741,10 +2743,13 @@ void PerimeterGenerator::process_arachne()
             Arachne::WallToolPathsParams input_params_tmp = input_params;
         
             Polygons   last_p = to_polygons(last);
+            // Orca: graded wall reinforcement walls the band instead of the island, see WallBand.hpp.
+            std::optional<WallBandPaths> band = wall_band_paths(*this, surface, last, input_params_tmp);
+            if (band) { last_p = std::move(band->outline); loop_number = band->loop_number; input_params_tmp = band->params; }
             Arachne::WallToolPaths wallToolPaths(last_p, bead_width_0, perimeter_spacing, coord_t(loop_number + 1),
                                                    wall_0_inset, layer_height, input_params_tmp);
             std::vector<Arachne::VariableWidthLines>   perimeters = wallToolPaths.getToolPaths();
-            ExPolygons  infill_contour = union_ex(wallToolPaths.getInnerContour());
+            ExPolygons  infill_contour = band ? std::move(band->infill_contour) : union_ex(wallToolPaths.getInnerContour());
 
             // Check if there are some remaining perimeters to generate (the number of perimeters
             // is greater than one together with enabled the single perimeter on top surface feature).
