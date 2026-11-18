@@ -1,10 +1,12 @@
 #include "WallBand.hpp"
 
 #include "AABBTreeLines.hpp"
+#include "Arachne/WallToolPaths.hpp"
 #include "Arachne/utils/ExtrusionJunction.hpp"
 #include "Arachne/utils/ExtrusionLine.hpp"
 #include "BoundingBox.hpp"
 #include "ClipperUtils.hpp"
+#include "ExPolygon.hpp"
 #include "Flow.hpp"
 #include "Geometry.hpp"
 #include "Layer.hpp"
@@ -26,6 +28,7 @@
 #include <cstddef>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <optional>
 #include <tuple>
 #include <utility>

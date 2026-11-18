@@ -4,7 +4,9 @@
 #include <cstddef>
 #include <iostream>
 #include <memory>
+#include <ratio>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_message.hpp>
