@@ -3086,6 +3086,8 @@ TEST_CASE("The beads of a ramp band cover at least 98% of it", "[Perimeters][Wal
     const Layer *layer = layer_at(print, print_z);
     REQUIRE(layer != nullptr);
     REQUIRE(walls_across_side(*layer, 17.5) == 4);
+    // The band, not the hard step, which walls the modifier's outline.
+    REQUIRE_THAT(buried_wall_length(*layer), Catch::Matchers::WithinAbs(0., 0.5));
 
     const ExPolygons band = ramp_band(*layer);
     Polygons beads;
@@ -3115,6 +3117,8 @@ TEST_CASE("The beads of a ramp band overlap no more than stock Arachne's beads o
     const Layer *layer = layer_at(print, print_z);
     REQUIRE(layer != nullptr);
     REQUIRE(walls_across_side(*layer, 17.5) == 4);
+    // The band, not the hard step, which walls the modifier's outline.
+    REQUIRE_THAT(buried_wall_length(*layer), Catch::Matchers::WithinAbs(0., 0.5));
 
     // With the 4 walls of the zone plus one, as wall_band_paths() asks for. WallToolPaths keeps a reference to the
     // outline.
@@ -3144,6 +3148,8 @@ TEST_CASE("The beads of a ramp band stay within Arachne's bead widths and under 
     const Layer *layer = layer_at(print, print_z);
     REQUIRE(layer != nullptr);
     REQUIRE(walls_across_side(*layer, 17.5) == 4);
+    // The band, not the hard step, which walls the modifier's outline.
+    REQUIRE_THAT(buried_wall_length(*layer), Catch::Matchers::WithinAbs(0., 0.5));
 
     const int zone_loops = 4, base_loops = 2;
     const Arachne::WallToolPathsParams params   = arachne_params(config, layer->id());
