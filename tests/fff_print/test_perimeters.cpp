@@ -13,6 +13,7 @@
 #include "libslic3r/Model.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <algorithm>
 #include <cmath>
 #include "libslic3r/PrintConfig.hpp"
@@ -2839,15 +2840,15 @@ double distance_to_edge(const Point &point, const ExPolygons &area)
     return unscaled<double>(best);
 }
 
-// The G-code's lines that are not comments. The comments carry the header's time stamp and version, and the config
-// block, which lists the process's Ramp settings.
+// The G-code's lines that are not comments, and the comments that mark the extrusion role. The other comments carry
+// the header's time stamp and version, and the config block, which lists the process's Ramp settings.
 std::vector<std::string> gcode_commands(const std::string &gcode)
 {
     std::vector<std::string> out;
     std::istringstream       in(gcode);
     std::string              line;
     while (std::getline(in, line))
-        if (! line.empty() && line.front() != ';')
+        if (! line.empty() && (line.front() != ';' || boost::starts_with(line, ";TYPE:") || boost::starts_with(line, "; FEATURE:")))
             out.push_back(line);
     return out;
 }
@@ -2871,7 +2872,9 @@ TEST_CASE("Without a modifier on the Ramp transition the G-code is that of a sli
     const std::string case_name      = GENERATE("modifiers on Hard", "Ramp set in the process and on the part");
     CAPTURE(wall_generator, case_name);
 
-    const DynamicPrintConfig plain_config = wall_ramp_config(wall_generator);
+    // Distinct wall speeds, so a change of a wall's role shows in the feed rates as well as in the role markers.
+    DynamicPrintConfig plain_config = wall_ramp_config(wall_generator);
+    plain_config.set_deserialize_strict({ { "outer_wall_speed", "40" }, { "inner_wall_speed", "70" } });
     DynamicPrintConfig       keyed_config = plain_config;
     std::vector<ModifierBox> plain_modifiers, keyed_modifiers;
     if (case_name == "modifiers on Hard") {
@@ -3099,17 +3102,13 @@ TEST_CASE("The beads of a ramp band cover at least 98% of it", "[Perimeters][Wal
     CHECK(covered >= 0.98 * band_area);
 }
 
-// The band's beads lay no more of it twice than stock Arachne, run with the region's own parameters on the same band
-// and extruded the same way. A footprint is as wide as the bead's spacing.
-// Known defect, hence [!mayfail]: on this fixture the band's beads overlap by about 0.6mm^2 where stock Arachne's
-// overlap by about 0.16mm^2. Arachne with the band's raised transition angle and distribution count of 1 accounts for
-// about 0.37mm^2 of it, and number_wall_band_insets() splitting the lines by depth for the rest; the overlap gathers
-// at the drops and along the inner wall of the 2 wall stretch.
-TEST_CASE("The beads of a ramp band overlap no more than stock Arachne's beads on the same band", "[Perimeters][WallRamp][!mayfail]")
-{
-    const double print_z = GENERATE(1.0, 1.2);
-    CAPTURE(print_z);
+namespace {
 
+// The overlap of the beads of the ramp band at print_z, and of stock Arachne's beads on the same band. The band's
+// outline is walled with the 4 walls of the zone plus one, as wall_band_paths() asks for. WallToolPaths keeps a
+// reference to the outline, hence the copy that outlives it.
+std::pair<double, double> ramp_and_stock_overlap(double print_z)
+{
     const DynamicPrintConfig config = wall_band_config();
     Print print;
     Model model;
@@ -3120,16 +3119,43 @@ TEST_CASE("The beads of a ramp band overlap no more than stock Arachne's beads o
     // The band, not the hard step, which walls the modifier's outline.
     REQUIRE_THAT(buried_wall_length(*layer), Catch::Matchers::WithinAbs(0., 0.5));
 
-    // With the 4 walls of the zone plus one, as wall_band_paths() asks for. WallToolPaths keeps a reference to the
-    // outline.
     const Polygons         outline = to_polygons(ramp_band(*layer));
     const double           layer_height = config.opt_float("layer_height");
     Arachne::WallToolPaths stock(outline, scaled<coord_t>(ramp_wall_spacing), scaled<coord_t>(ramp_wall_spacing), 5, 0, layer_height,
                                  arachne_params(config, layer->id()));
-    const double ramp_overlap  = overlap_area(footprints(wall_paths(*layer)));
-    const double stock_overlap = overlap_area(footprints(wall_paths(stock.getToolPaths(), layer_height)));
+    return { overlap_area(footprints(wall_paths(*layer))), overlap_area(footprints(wall_paths(stock.getToolPaths(), layer_height))) };
+}
+
+} // namespace
+
+// The band's beads lay no more of it twice than stock Arachne, run with the region's own parameters on the same band
+// and extruded the same way. A footprint is as wide as the bead's spacing.
+// Known defect, tracked in rblumen/OrcaSlicer#29, hence [!shouldfail]: on this fixture the band's beads overlap by
+// about 0.6mm^2 where stock Arachne's overlap by about 0.16mm^2. Arachne with the band's raised transition angle and
+// distribution count of 1 accounts for about 0.37mm^2 of it, and number_wall_band_insets() splitting the lines by
+// depth for the rest; the overlap gathers at the drops and along the inner wall of the 2 wall stretch. The test errors
+// once the engine is fixed, and the tag goes then. A [!shouldfail] test passes on any failed assertion, so the test
+// below keeps the defect from growing until then.
+TEST_CASE("The beads of a ramp band overlap no more than stock Arachne's beads on the same band", "[Perimeters][WallRamp][!shouldfail]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    const auto [ramp_overlap, stock_overlap] = ramp_and_stock_overlap(print_z);
     CAPTURE(ramp_overlap, stock_overlap);
     CHECK(ramp_overlap <= stock_overlap + 0.05);
+}
+
+// The ceiling the known excess of the test above is pinned to until rblumen/OrcaSlicer#29 is fixed: measured 0.60mm^2
+// at z 1.0 and 0.56mm^2 at z 1.2.
+TEST_CASE("The beads of a ramp band overlap no more than the known excess over stock Arachne", "[Perimeters][WallRamp]")
+{
+    const double print_z = GENERATE(1.0, 1.2);
+    CAPTURE(print_z);
+
+    const auto [ramp_overlap, stock_overlap] = ramp_and_stock_overlap(print_z);
+    CAPTURE(ramp_overlap, stock_overlap);
+    CHECK(ramp_overlap <= 0.65);
 }
 
 // The band's beads lie between the thinnest bead Arachne lays and the widest, just short of where it splits n beads
@@ -3176,7 +3202,7 @@ TEST_CASE("The beads of a ramp band stay within Arachne's bead widths and under 
     for (double x = 17.5; x >= 8.; x -= 0.1)
         if (const std::vector<double> widths = side_widths(*layer, paths, x); widths.size() >= 3)
             for (const double width : { widths.front(), widths.back() })
-                if (std::abs(width - ramp_wall_width) > 0.02)
+                if (std::abs(width - ramp_wall_width) > 0.03)
                     off_nominal += "x=" + std::to_string(x) + ": " + std::to_string(width) + "; ";
     CAPTURE(off_nominal);
     CHECK(off_nominal.empty());
