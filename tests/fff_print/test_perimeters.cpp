@@ -27,6 +27,7 @@
 #include "libslic3r/Config.hpp"
 #include "libslic3r/PrintBase.hpp"
 #include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/WallBand.hpp"
 #include <functional>
 #include <initializer_list>
 #include <limits>
@@ -2146,4 +2147,68 @@ TEST_CASE("A modifier with more walls and a ramped transition tapers the walls f
     CHECK(std::is_sorted(counts.rbegin(), counts.rend()));
     CHECK(std::find(counts.begin(), counts.end(), 3) != counts.end());
     CHECK(perimeter_warnings(print).empty());
+}
+
+// Walls the band does not support yet keep the stock walls, which the object reports rather than leaving silent.
+TEST_CASE("An island in a ramp zone that takes alternating extra walls keeps the stock walls and warns", "[Perimeters][WallRamp]")
+{
+    DynamicPrintConfig config = wall_ramp_config("arachne");
+    config.set_deserialize_strict({ { "alternate_extra_wall", 1 }, { "sparse_infill_density", "15%" } });
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } }));
+    CHECK_THAT(perimeter_warnings(print), Catch::Matchers::ContainsSubstring("Alternate extra wall"));
+}
+
+// only_one_wall_top has nothing to act on without a top shell, so it must not keep the band from the zone.
+TEST_CASE("The only one wall on top option does not stop the ramp walls where there is no top shell", "[Perimeters][WallRamp]")
+{
+    DynamicPrintConfig config = wall_ramp_config("arachne");
+    config.set_deserialize_strict({ { "only_one_wall_top", 1 }, { "top_shell_layers", 0 } });
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, config, wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } }));
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK(walls_across_side(*layer, 17.5) == 4);
+    CHECK(perimeter_warnings(print).empty());
+}
+
+TEST_CASE("A steep ramp raises the transition angle no further than the option allows", "[Perimeters][WallRamp]")
+{
+    const double max_angle = print_config_def.get("wall_transition_angle")->max;
+    CHECK(wall_band_transition_angle(10.f, 0.5) <= max_angle);
+    // A gentle ramp raises it only by what it needs.
+    CHECK_THAT(wall_band_transition_angle(10.f, 10.), Catch::Matchers::WithinAbs(std::atan(0.1) * 180. / M_PI + 5., 1e-3));
+
+    Print print;
+    Model model;
+    part_with_wall_modifier(print, model, wall_ramp_config("arachne"),
+                            wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 0.5 } }));
+    const Layer *layer = layer_at(print, ramp_layer_z);
+    REQUIRE(layer != nullptr);
+    CHECK(walls_across_side(*layer, 17.5) == 4);
+}
+
+// The zone spans the object's height, so a modifier cannot take one wall count over one height range and another over
+// the next.
+TEST_CASE("A modifier with a ramped transition whose base wall count differs between height ranges keeps the stock walls and warns", "[Perimeters][WallRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, wall_ramp_config("arachne"), { -1 },
+                               { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" }, { "wall_ramp_taper_ratio", 5. } })) },
+                               [](ModelObject &object) {
+                                   DynamicPrintConfig range;
+                                   range.set_deserialize_strict({ { "wall_loops", 3 }, { "layer_height", 0.2 } });
+                                   object.layer_config_ranges[{ 1., 2. }].assign_config(std::move(range));
+                               });
+    const Layer *lower = layer_at(print, 0.6);
+    const Layer *upper = layer_at(print, 1.6);
+    REQUIRE(lower != nullptr);
+    REQUIRE(upper != nullptr);
+    // The part's 2 walls below z = 1 and 3 above, also inside the modifier.
+    CHECK(walls_across_side(*lower, 17.5) == 2);
+    CHECK(walls_across_side(*upper, 17.5) == 3);
+    CHECK_THAT(perimeter_warnings(print), Catch::Matchers::ContainsSubstring("every height range"));
 }
