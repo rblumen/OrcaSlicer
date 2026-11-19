@@ -2536,13 +2536,27 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         }
     }
 
+    // Orca: locally reinforced walls contradict spiral vase mode, which prints a single continuous wall, and its slicing
+    // builds no ramp band, so a modifier with the Ramp wall count transition is an error there.
+    if (m_config.spiral_mode)
+        for (const PrintObject *print_object : m_objects) {
+            const ModelObject *model_object = print_object->model_object();
+            if (std::any_of(model_object->volumes.begin(), model_object->volumes.end(), [](const ModelVolume *volume) {
+                    const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option("wall_loops_transition") : nullptr;
+                    return transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp); }))
+                // TRN: %1% is the name of an object.
+                return { Slic3r::format(_u8L("Object %1% has a modifier with the Ramp wall count transition, which can't be used with Spiral vase mode."),
+                                        model_object->name),
+                         model_object, "wall_loops_transition" };
+        }
+
     // Orca: a modifier with the Ramp wall count transition keeps all its walls under top surfaces, so Only one wall on
     // top surfaces set on the modifier itself contradicts it. A value inherited from the process is overridden quietly.
-    // With the Classic wall generator the modifier uses the Hard transition instead, see below.
+    // Where the transition is not active the modifier uses the Hard transition instead, see below.
     for (const PrintObject *print_object : m_objects)
         for (const ModelVolume *volume : print_object->model_object()->volumes) {
-            if (print_object->config().wall_generator.value != PerimeterGeneratorType::Arachne ||
-                ! volume->is_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
+            if (! wall_ramp_active(m_config, print_object->config()) ||
+                ! volume->is_region_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
                 continue;
             const DynamicPrintConfig &cfg = volume->config.get();
             const bool ramp = (cfg.has("wall_loops_transition") ? cfg.opt_enum<WallLoopsTransition>("wall_loops_transition") :

@@ -1720,12 +1720,10 @@ std::string perimeter_warnings(const Print &print)
 // transition merges the modifier's region with the part's, which walls the outline of the part only.
 TEST_CASE("A modifier with more walls and a ramped transition shares the part's walls instead of walling its outline inside the part", "[Perimeters][WallRamp]")
 {
-    const char *wall_generator = "arachne";
-
     Print hard_print, ramp_print;
     Model hard_model, ramp_model;
-    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator), wall_modifier_config({}));
-    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator), wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config("arachne"), wall_modifier_config({}));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config("arachne"), wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
     const Layer *hard = layer_at(hard_print, ramp_layer_z);
     const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
     REQUIRE(hard != nullptr);
@@ -1761,12 +1759,10 @@ TEST_CASE("A modifier on the Hard transition slices as one without the wall coun
 // A modifier thinning the walls merges with the part like one thickening them.
 TEST_CASE("A modifier with fewer walls and a ramped transition shares the part's walls instead of walling its outline inside the part", "[Perimeters][WallRamp]")
 {
-    const char *wall_generator = "arachne";
-
     Print hard_print, ramp_print;
     Model hard_model, ramp_model;
-    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator, 4), wall_modifier_config({ { "wall_loops", 2 } }));
-    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator, 4),
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config("arachne", 4), wall_modifier_config({ { "wall_loops", 2 } }));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config("arachne", 4),
                             wall_modifier_config({ { "wall_loops", 2 }, { "wall_loops_transition", "ramp" } }));
     const Layer *hard = layer_at(hard_print, ramp_layer_z);
     const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
@@ -1784,12 +1780,10 @@ TEST_CASE("A modifier with fewer walls and a ramped transition shares the part's
 // A modifier may thin the walls down to none. It merges with the part like any other, without a warning.
 TEST_CASE("A modifier without walls and with a ramped transition shares the part's walls", "[Perimeters][WallRamp]")
 {
-    const char *wall_generator = "arachne";
-
     Print hard_print, ramp_print;
     Model hard_model, ramp_model;
-    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config(wall_generator), wall_modifier_config({ { "wall_loops", 0 } }));
-    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config(wall_generator),
+    part_with_wall_modifier(hard_print, hard_model, wall_ramp_config("arachne"), wall_modifier_config({ { "wall_loops", 0 } }));
+    part_with_wall_modifier(ramp_print, ramp_model, wall_ramp_config("arachne"),
                             wall_modifier_config({ { "wall_loops", 0 }, { "wall_loops_transition", "ramp" } }));
     const Layer *hard = layer_at(hard_print, ramp_layer_z);
     const Layer *ramp = layer_at(ramp_print, ramp_layer_z);
@@ -1829,11 +1823,9 @@ TEST_CASE("A modifier with a ramped transition that cannot share the part's wall
 // each one shares the walls of its own part.
 TEST_CASE("A modifier with a ramped transition over parts with different wall counts shares the walls of each part", "[Perimeters][WallRamp]")
 {
-    const char *wall_generator = "arachne";
-
     Print print;
     Model model;
-    slice_parts_with_modifiers(print, model, wall_ramp_config(wall_generator), { 2, 3 },
+    slice_parts_with_modifiers(print, model, wall_ramp_config("arachne"), { 2, 3 },
                                { modifier_box(15., 25., wall_modifier_config({ { "wall_loops_transition", "ramp" } })) });
     const Layer *layer = layer_at(print, ramp_layer_z);
     REQUIRE(layer != nullptr);
@@ -1967,6 +1959,64 @@ TEST_CASE("Switching the wall generator re-keys the region of a modifier on the 
     CHECK(regions_with_walls(*layer_at(print, ramp_layer_z)) == 1);
 }
 
+// Locally reinforced walls contradict spiral vase mode, so validation rejects a Ramp modifier there instead of falling back.
+TEST_CASE("Print validation rejects a modifier with the Ramp transition in spiral vase mode", "[Perimeters][WallRamp]")
+{
+    struct Variant { const char *wall_generator; const char *transition; bool spiral_mode; bool error; };
+    const Variant variant = GENERATE(
+        Variant{ "arachne", "ramp", true,  true },
+        Variant{ "classic", "ramp", true,  true },
+        Variant{ "arachne", "hard", true,  false },
+        Variant{ "arachne", "ramp", false, false });
+    CAPTURE(variant.wall_generator, variant.transition, variant.spiral_mode);
+
+    // Resetting the extruder at each layer keeps relative extrusion from failing validation for its own reason.
+    DynamicPrintConfig config = wall_ramp_config(variant.wall_generator);
+    config.set_deserialize_strict({ { "spiral_mode", variant.spiral_mode ? 1 : 0 }, { "layer_change_gcode", "G92 E0" } });
+    Print print;
+    Model model;
+    Test::init_print({ make_cube(20., 20., 2.) }, print, model, config, nullptr, false);
+    TriangleMesh modifier = make_cube(10., 30., 4.);
+    modifier.translate(15.f, -5.f, -1.f);
+    model.objects.front()->add_volume(std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, false)
+        ->config.apply(wall_modifier_config({ { "wall_loops_transition", variant.transition } }));
+    print.apply(model, config);
+
+    std::vector<StringObjectException> warnings;
+    const StringObjectException result = print.validate(&warnings);
+    if (variant.error) {
+        CHECK_THAT(result.string, Catch::Matchers::ContainsSubstring("can't be used with Spiral vase mode"));
+        CHECK(result.opt_key == "wall_loops_transition");
+    } else {
+        CHECK(result.string.empty());
+    }
+    // The error replaces the fallback warning.
+    CHECK(std::none_of(warnings.begin(), warnings.end(), [](const StringObjectException &w) { return w.opt_key == "wall_generator"; }));
+}
+
+// Without a ramp band in spiral vase mode the modifier is not keyed into the part's walls, and toggling the mode re-keys it.
+TEST_CASE("Toggling spiral vase mode re-keys the region of a modifier on the Ramp transition", "[Perimeters][WallRamp]")
+{
+    DynamicPrintConfig config = wall_ramp_config("arachne");
+    Print print;
+    Model model;
+    Test::init_print({ make_cube(20., 20., 2.) }, print, model, config, nullptr, false);
+    TriangleMesh modifier = make_cube(10., 30., 4.);
+    modifier.translate(15.f, -5.f, -1.f);
+    model.objects.front()->add_volume(std::move(modifier), ModelVolumeType::PARAMETER_MODIFIER, false)
+        ->config.apply(wall_modifier_config({ { "wall_loops_transition", "ramp" } }));
+    print.apply(model, config);
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2 });
+
+    config.set_deserialize_strict({ { "spiral_mode", 1 } });
+    print.apply(model, config);
+    CHECK(wall_ramp_base_loops(print).empty());
+
+    config.set_deserialize_strict({ { "spiral_mode", 0 } });
+    print.apply(model, config);
+    CHECK(wall_ramp_base_loops(print) == std::vector<int>{ 2 });
+}
+
 // Switching a modifier to the Ramp transition regenerates the walls from the existing slices.
 TEST_CASE("Switching a modifier to the Ramp transition regenerates its walls without reslicing", "[Perimeters][WallRamp]")
 {
@@ -2065,11 +2115,9 @@ TEST_CASE("A modifier with a ramped transition is not taken by an earlier part o
 // A modifier with 6 walls inside one with 4, both with a ramped transition, on a part with 2: all three share walls.
 TEST_CASE("Nested modifiers with ramped transitions share the part's walls", "[Perimeters][WallRamp]")
 {
-    const char *wall_generator = "arachne";
-
     Print print;
     Model model;
-    slice_parts_with_modifiers(print, model, wall_ramp_config(wall_generator), { -1 },
+    slice_parts_with_modifiers(print, model, wall_ramp_config("arachne"), { -1 },
                                { modifier_box(10., 30., wall_modifier_config({ { "wall_loops_transition", "ramp" } })),
                                  modifier_box(14., 30., wall_modifier_config({ { "wall_loops", 6 }, { "wall_loops_transition", "ramp" } })) });
     const Layer *layer = layer_at(print, ramp_layer_z);
