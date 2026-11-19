@@ -2161,7 +2161,7 @@ TEST_CASE("The Ramp transition set in the process or on a part has no effect", "
                                [&where](ModelObject &object) {
                                    if (where == "part")
                                        object.volumes.front()->config.set_key_value("wall_loops_transition",
-                                           new ConfigOptionEnum<WallLoopsTransition>(WallLoopsTransition::Ramp));
+                                           new ConfigOptionEnum<CountTransition>(CountTransition::Ramp));
                                });
     CHECK(wall_ramp_base_loops(ramp_print).empty());
     const SliceLengths plain = slice_lengths(plain_print);
@@ -3022,7 +3022,7 @@ TEST_CASE("Without a modifier on the Ramp transition the G-code is that of a sli
     slice_parts_with_modifiers(plain_print, plain_model, plain_config, { -1 }, plain_modifiers);
     slice_parts_with_modifiers(keyed_print, keyed_model, keyed_config, { -1 }, keyed_modifiers, [&case_name](ModelObject &object) {
         if (case_name != "modifiers on Hard")
-            object.volumes.front()->config.set_key_value("wall_loops_transition", new ConfigOptionEnum<WallLoopsTransition>(WallLoopsTransition::Ramp));
+            object.volumes.front()->config.set_key_value("wall_loops_transition", new ConfigOptionEnum<CountTransition>(CountTransition::Ramp));
     });
     const std::vector<std::string> plain = gcode_commands(gcode(plain_print));
     const std::vector<std::string> keyed = gcode_commands(gcode(keyed_print));

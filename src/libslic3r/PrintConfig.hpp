@@ -259,8 +259,8 @@ enum class WallDirection
     Count,
 };
 
-// Orca: How the wall count changes at the boundary of a modifier.
-enum class WallLoopsTransition
+// Orca: How a wall or shell count changes at the boundary of a modifier.
+enum class CountTransition
 {
     Hard,
     Ramp,
@@ -843,7 +843,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ArcFittingMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SurfaceFillOrder)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AdaptiveInfillMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(AdaptiveInfillGradient)
-CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(WallLoopsTransition)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(CountTransition)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1465,6 +1465,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionStrings,  print_extruder_variant))
     ((ConfigOptionInt,                  bottom_shell_layers))
     ((ConfigOptionFloat,                bottom_shell_thickness))
+    ((ConfigOptionEnum<CountTransition>, bottom_shell_layers_transition))
+    ((ConfigOptionFloat,                bottom_shell_ramp_taper_ratio))
     ((ConfigOptionInt,                  bottom_color_penetration_layers))
     ((ConfigOptionFloat,                bridge_angle))
     ((ConfigOptionFloat,                internal_bridge_angle)) // ORCA: Internal bridge angle override
@@ -1574,6 +1576,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloatOrPercent, top_surface_line_width))
     ((ConfigOptionInt, top_shell_layers))
     ((ConfigOptionFloat, top_shell_thickness))
+    ((ConfigOptionEnum<CountTransition>, top_shell_layers_transition))
+    ((ConfigOptionFloat, top_shell_ramp_taper_ratio))
     ((ConfigOptionInt, top_color_penetration_layers))
     ((ConfigOptionFloat, top_surface_expansion))
     ((ConfigOptionFloat, top_surface_expansion_margin))
@@ -1629,7 +1633,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                is_infill_first))
     ((ConfigOptionBool,                small_area_infill_flow_compensation))
     ((ConfigOptionEnum<WallDirection>,  wall_direction))
-    ((ConfigOptionEnum<WallLoopsTransition>, wall_loops_transition))
+    ((ConfigOptionEnum<CountTransition>, wall_loops_transition))
     ((ConfigOptionFloat,                wall_ramp_taper_ratio))
 
     // Orca: other flow ratios (available for overriding, if set_other_flow_ratios is enabled)

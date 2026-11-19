@@ -432,6 +432,86 @@ TEST_CASE("A modifier's wall count transition survives a project round trip", "[
     CHECK((*modifier)->config.opt_int("wall_loops") == 4);
 }
 
+// Stores a model of one part and one modifier with the given config as a project, and returns the reloaded modifier's config.
+static DynamicPrintConfig shell_ramp_modifier_round_trip(const DynamicPrintConfig &modifier_config)
+{
+    ScopedSlic3rTemporaryDir temporary_dir("orca_shell_ramp");
+
+    Model model;
+    ModelObject *object = model.add_object();
+    object->add_volume(make_cube(20.0, 20.0, 10.0));
+    object->add_volume(make_cube(10.0, 10.0, 10.0), ModelVolumeType::PARAMETER_MODIFIER)->config.apply(modifier_config);
+    object->add_instance();
+
+    DynamicPrintConfig project;
+    model.set_backup_path((temporary_dir.path() / "source_backup").string());
+    const std::string path = (temporary_dir.path() / "shell_ramp.3mf").string();
+    auto plate = std::make_unique<PlateData>();
+    plate->plate_index = 0;
+    StoreParams store_params;
+    store_params.path = path.c_str();
+    store_params.model = &model;
+    store_params.config = &project;
+    store_params.plate_data_list.push_back(plate.get());
+    store_params.strategy = SaveStrategy::Zip64 | SaveStrategy::Silence;
+    REQUIRE(store_bbs_3mf(store_params));
+
+    Model reloaded_model;
+    DynamicPrintConfig reloaded;
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Disable};
+    PlateDataPtrs reloaded_plates;
+    std::vector<Preset *> project_presets;
+    bool is_bbl_3mf = false;
+    bool is_orca_3mf = false;
+    Semver file_version;
+    const bool loaded = load_bbs_3mf(path.c_str(), &reloaded, &substitutions, &reloaded_model, &reloaded_plates,
+        &project_presets, &is_bbl_3mf, &is_orca_3mf, &file_version, nullptr, LoadStrategy::LoadModel | LoadStrategy::LoadConfig);
+    release_PlateData_list(reloaded_plates);
+    for (Preset *preset : project_presets)
+        delete preset;
+
+    REQUIRE(loaded);
+    REQUIRE(reloaded_model.objects.size() == 1);
+    const ModelVolumePtrs &volumes = reloaded_model.objects.front()->volumes;
+    const auto modifier = std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return v->is_modifier(); });
+    REQUIRE(modifier != volumes.end());
+    return (*modifier)->config.get();
+}
+
+TEST_CASE("A modifier's shell count transitions survive a project round trip", "[3mf][Config][ShellRamp]")
+{
+    DynamicPrintConfig modifier_config;
+    modifier_config.set_deserialize_strict({
+        { "top_shell_layers",               7 },
+        { "top_shell_layers_transition",    "ramp" },
+        { "top_shell_ramp_taper_ratio",     5. },
+        { "bottom_shell_layers_transition", "ramp" },
+        { "bottom_shell_ramp_taper_ratio",  2.5 },
+    });
+    const DynamicPrintConfig reloaded = shell_ramp_modifier_round_trip(modifier_config);
+    REQUIRE(reloaded.has("top_shell_layers_transition"));
+    REQUIRE(reloaded.has("bottom_shell_layers_transition"));
+    CHECK(reloaded.opt_serialize("top_shell_layers_transition") == "ramp");
+    CHECK(reloaded.opt_serialize("bottom_shell_layers_transition") == "ramp");
+    CHECK_THAT(reloaded.opt_float("top_shell_ramp_taper_ratio"), Catch::Matchers::WithinAbs(5., 1e-9));
+    CHECK_THAT(reloaded.opt_float("bottom_shell_ramp_taper_ratio"), Catch::Matchers::WithinAbs(2.5, 1e-9));
+    CHECK(reloaded.opt_int("top_shell_layers") == 7);
+}
+
+TEST_CASE("A project modifier without the shell count transitions loads as a hard step", "[3mf][Config][ShellRamp]")
+{
+    DynamicPrintConfig modifier_config;
+    modifier_config.set_deserialize_strict({ { "top_shell_layers", 7 } });
+    const DynamicPrintConfig reloaded = shell_ramp_modifier_round_trip(modifier_config);
+    CHECK_FALSE(reloaded.has("top_shell_layers_transition"));
+    CHECK_FALSE(reloaded.has("bottom_shell_layers_transition"));
+    PrintRegionConfig region;
+    region.apply(reloaded, true);
+    CHECK(region.top_shell_layers.value == 7);
+    CHECK(region.top_shell_layers_transition.value == CountTransition::Hard);
+    CHECK(region.bottom_shell_layers_transition.value == CountTransition::Hard);
+}
+
 SCENARIO("Mirrored instance transforms survive 3mf round trips", "[3mf][Regression]") {
     const bool bbs_format = GENERATE(false, true);
 

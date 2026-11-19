@@ -2537,17 +2537,27 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     }
 
     // Orca: locally reinforced walls contradict spiral vase mode, which prints a single continuous wall, and its slicing
-    // builds no ramp band, so a modifier with the Ramp wall count transition is an error there.
+    // builds no ramp band, so a modifier with the Ramp wall count transition is an error there. Spiral vase mode prints
+    // no top shell and a fixed bottom, so the Ramp shell count transitions are an error too.
     if (m_config.spiral_mode)
         for (const PrintObject *print_object : m_objects) {
             const ModelObject *model_object = print_object->model_object();
-            if (std::any_of(model_object->volumes.begin(), model_object->volumes.end(), [](const ModelVolume *volume) {
-                    const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option("wall_loops_transition") : nullptr;
-                    return transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp); }))
+            auto has_ramp_modifier = [model_object](const char *opt_key) {
+                return std::any_of(model_object->volumes.begin(), model_object->volumes.end(), [opt_key](const ModelVolume *volume) {
+                    const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option(opt_key) : nullptr;
+                    return transition != nullptr && transition->getInt() == int(CountTransition::Ramp); });
+            };
+            if (has_ramp_modifier("wall_loops_transition"))
                 // TRN: %1% is the name of an object.
                 return { Slic3r::format(_u8L("Object %1% has a modifier with the Ramp wall count transition, which can't be used with Spiral vase mode."),
                                         model_object->name),
                          model_object, "wall_loops_transition" };
+            for (const char *opt_key : { "top_shell_layers_transition", "bottom_shell_layers_transition" })
+                if (has_ramp_modifier(opt_key))
+                    // TRN: %1% is the name of an object.
+                    return { Slic3r::format(_u8L("Object %1% has a modifier with the Ramp shell count transition, which can't be used with Spiral vase mode."),
+                                            model_object->name),
+                             model_object, opt_key };
         }
 
     // Orca: a modifier with the Ramp wall count transition keeps all its walls under top surfaces, so Only one wall on
@@ -2559,8 +2569,8 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 ! volume->is_region_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
                 continue;
             const DynamicPrintConfig &cfg = volume->config.get();
-            const bool ramp = (cfg.has("wall_loops_transition") ? cfg.opt_enum<WallLoopsTransition>("wall_loops_transition") :
-                                                                    m_default_region_config.wall_loops_transition.value) == WallLoopsTransition::Ramp;
+            const bool ramp = (cfg.has("wall_loops_transition") ? cfg.opt_enum<CountTransition>("wall_loops_transition") :
+                                                                    m_default_region_config.wall_loops_transition.value) == CountTransition::Ramp;
             const int  wall_loops = cfg.has("wall_loops") ? cfg.opt_int("wall_loops") : m_default_region_config.wall_loops.value;
             if (ramp && wall_loops > 1)
                 // TRN: %1% is the name of a modifier, %2% the name of an object.
@@ -2571,14 +2581,14 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         }
 
     // Orca: only Arachne walls follow the Ramp wall count transition, so with the Classic wall generator a modifier set
-    // to Ramp uses the Hard transition, see wall_ramp_key() in PrintApply.cpp. Warn once per object.
+    // to Ramp uses the Hard transition, see ramp_key() in PrintApply.cpp. Warn once per object.
     std::set<const ModelObject*> classic_ramp_objects;
     for (const PrintObject *print_object : m_objects) {
         const ModelObject *model_object = print_object->model_object();
         if (print_object->config().wall_generator.value == PerimeterGeneratorType::Arachne || classic_ramp_objects.count(model_object) > 0 ||
             std::none_of(model_object->volumes.begin(), model_object->volumes.end(), [](const ModelVolume *volume) {
                 const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option("wall_loops_transition") : nullptr;
-                return transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp); }))
+                return transition != nullptr && transition->getInt() == int(CountTransition::Ramp); }))
             continue;
         classic_ramp_objects.insert(model_object);
         // TRN: %1% is the name of an object. "Wall generator" is the name of a setting, "Arachne" and "Classic" are its values.

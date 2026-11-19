@@ -714,6 +714,40 @@ void PrintObject::prepare_infill()
     if (! this->set_started(posPrepareInfill))
         return;
     m_print->set_status(25, L("Generating infill regions"));
+
+    // Orca: A modifier whose shell transition is Ramp but whose taper ratio is 0 keeps the hard step at its outline.
+    // Warn about that, unless the modifier does not change the shell it modifies.
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges)
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
+            if (volume_region.parent < 0 || volume_region.region == layer_range.volume_regions[volume_region.parent].region)
+                continue;
+            const PrintRegion       &modifier = *volume_region.region;
+            const PrintRegionConfig &config   = modifier.config();
+            const RampKey           &key      = modifier.ramp_key();
+            const bool top_falls_back    = key.top_base_layers >= 0 && ! modifier.has_top_shell_ramp() &&
+                (config.top_shell_layers.value != key.top_base_layers || config.top_shell_thickness.value != key.top_base_thickness);
+            const bool bottom_falls_back = key.bottom_base_layers >= 0 && ! modifier.has_bottom_shell_ramp() &&
+                (config.bottom_shell_layers.value != key.bottom_base_layers || config.bottom_shell_thickness.value != key.bottom_base_thickness);
+            if (! top_falls_back && ! bottom_falls_back)
+                continue;
+            // A modifier overlapping only the bounding box of the region has nothing to ramp.
+            const int region_id = modifier.print_object_region_id();
+            if (std::none_of(m_layers.begin(), m_layers.end(), [region_id](const Layer *layer) { return ! layer->get_region(region_id)->slices.empty(); }))
+                continue;
+            if (top_falls_back)
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard top shell count transition: the Ramp transition needs "
+                                        "a taper ratio above 0."),
+                                   volume_region.model_volume->name, this->model_object()->name));
+            if (bottom_falls_back)
+                this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                    // TRN: %1% is the name of a modifier, %2% the name of an object.
+                    Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard bottom shell count transition: the Ramp transition "
+                                        "needs a taper ratio above 0."),
+                                   volume_region.model_volume->name, this->model_object()->name));
+        }
+
     if (m_typed_slices) {
         // To improve robustness of detect_surfaces_type() when reslicing (working with typed slices), see GH issue #7442.
         // The preceding step (perimeter generator) only modifies extra_perimeters and the extra perimeters are only used by discover_vertical_shells()
@@ -1757,6 +1791,11 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "infill_combination_max_layer_height"
             || opt_key == "bottom_shell_thickness"
             || opt_key == "top_shell_thickness"
+            // Orca: the Shell Ramp is applied when the shells are projected.
+            || opt_key == "top_shell_layers_transition"
+            || opt_key == "top_shell_ramp_taper_ratio"
+            || opt_key == "bottom_shell_layers_transition"
+            || opt_key == "bottom_shell_ramp_taper_ratio"
             || opt_key == "top_surface_expansion_margin"
             || opt_key == "top_surface_expansion_direction"
             || opt_key == "minimum_sparse_infill_area"
