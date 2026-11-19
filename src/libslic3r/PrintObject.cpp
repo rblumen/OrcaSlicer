@@ -660,9 +660,9 @@ void PrintObject::make_perimeters()
     }
 
     // Orca: the walls of modifiers with a ramped transition follow the object's thickness field, see WallBand.hpp.
-    // Only Arachne walls follow it, see LayerRegion::make_perimeters().
+    // Only Arachne walls follow it, and spiral vase mode builds none, see wall_ramp_active() and LayerRegion::make_perimeters().
     std::shared_ptr<const WallThicknessField> wall_thickness_field;
-    if (m_config.wall_generator.value == PerimeterGeneratorType::Arachne && ! m_print->config().spiral_mode) {
+    if (wall_ramp_active(m_print->config(), m_config)) {
         std::vector<const ModelVolume*> inconsistent_modifiers;
         wall_thickness_field = build_wall_thickness_field(*this, &inconsistent_modifiers);
         for (const ModelVolume *modifier : inconsistent_modifiers)

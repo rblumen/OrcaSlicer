@@ -153,6 +153,13 @@ struct WallRampKey
     bool operator<(const WallRampKey &rhs) const { return base < rhs.base || (base == rhs.base && root < rhs.root); }
 };
 
+// Orca: whether the Ramp wall count transition is active for an object. Only Arachne walls follow the ramp, and spiral
+// vase mode builds no ramp band, so a modifier set to Ramp is keyed (merged into its part's walls) only when this holds.
+inline bool wall_ramp_active(const PrintConfig &print_config, const PrintObjectConfig &object_config)
+{
+    return object_config.wall_generator.value == PerimeterGeneratorType::Arachne && ! print_config.spiral_mode.value;
+}
+
 class PrintRegion
 {
 public:
