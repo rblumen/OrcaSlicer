@@ -22,7 +22,6 @@
 #include <vector>
 
 #include "AABBTreeIndirect.hpp"
-#include "BoundingBox.hpp"
 #include "KDTreeIndirect.hpp"
 #include "Point.hpp"
 #include "Triangulation.hpp"
@@ -815,11 +814,14 @@ double SurfaceZoneDistance::signed_distance(const Vec3d &p) const
 SurfaceZoneDistance SurfaceZoneDistance::build(const indexed_triangle_set &part, const indexed_triangle_set &modifier_mesh, const SurfaceZoneDistanceParams &params)
 {
     SurfaceZoneDistance zone;
+    // Without a positive edge length the remesh has no target: leave the zone inactive.
+    if (! (params.fine_edge > 0.))
+        return zone;
     const double fine_edge   = params.fine_edge;
     const double coarse_edge = std::max(fine_edge, params.coarse_edge);
     const double tolerance   = std::max(0., params.surface_tolerance);
-    zone.m_inside_limit      = params.inside_limit;
-    zone.m_outside_limit     = params.outside_limit;
+    zone.m_inside_limit      = std::max(0., params.inside_limit);
+    zone.m_outside_limit     = std::max(0., params.outside_limit);
     // The distance is solved this far past the limits it saturates at, which keeps what the
     // open edge of the solved band does to the solution out of the range that is read.
     const double margin      = tolerance + 2. * coarse_edge;
@@ -1040,6 +1042,7 @@ SurfaceZoneDistance SurfaceZoneDistance::build(const indexed_triangle_set &part,
         zone.m_surface.its.indices.emplace_back(face);
     zone.m_surface.build_tree();
     zone.m_active = true;
-    return zone;}
+    return zone;
+}
 
 } // namespace Slic3r

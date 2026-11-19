@@ -49,7 +49,7 @@ struct TreeMesh
 
 struct SurfaceZoneDistanceParams
 {
-    // Longest mesh edge at the zone's boundary, in mm.
+    // Longest mesh edge at the zone's boundary, in mm. Must be positive, or the zone is inactive.
     double fine_edge { 0. };
     // Longest mesh edge where the distance is solved, in mm. Raised to fine_edge if shorter.
     double coarse_edge { 0. };
@@ -59,7 +59,7 @@ struct SurfaceZoneDistanceParams
     // off is out of the zone's reach and gets outside_limit.
     double surface_tolerance { 0.5 };
     // The distance saturates at -inside_limit inside the zone and at outside_limit outside it, both
-    // in mm and not negative.
+    // in mm; a negative value counts as 0.
     double inside_limit { 0. };
     double outside_limit { 0. };
 };
