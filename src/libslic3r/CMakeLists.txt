@@ -512,6 +512,8 @@ set(lisbslic3r_sources
     Support/TreeSupport.hpp
     SurfaceCollection.cpp
     SurfaceCollection.hpp
+    SurfaceZoneDistance.cpp
+    SurfaceZoneDistance.hpp
     Surface.cpp
     Surface.hpp
     SurfaceMesh.hpp
