@@ -17,6 +17,11 @@
 //
 // So inside the zone the shell is the modifier's and beyond the ramp the part's, exactly as the stock projection
 // builds them whatever the layer heights, and across the ramp the fractional n(d) steps the shell one layer at a time.
+// Where n and T move in opposite directions the interpolated rule alone can put fewer layers in the shell mid-ramp than
+// both ends do, so a layer is also in the shell wherever the rule of the thinner end, the one with the smaller
+// shell_depth(), puts it:
+//
+//     k < n(d)  or  dz < T(d) - EPSILON  or  k < n_thin  or  dz < T_thin - EPSILON
 // A minimum thickness counts only with shell layers, as in the stock projection, so T is taken as 0 where n is.
 //
 // The ramp is as long as the change of the shell's depth at the nominal layer height h, see shell_depth(), times the
@@ -25,7 +30,8 @@
 //     L_s = |D1 - D0| * rho_s,    D0 = shell_depth(n0, T0, h),    D1 = shell_depth(n1, T1, h)
 //
 // A zone thickens the shell when D1 > D0 and thins it when D1 < D0, down to no shell at n1 = 0; either way its ramp
-// lies outside it. A zone with D1 = D0 changes nothing.
+// lies outside it. A zone with D1 = D0 changes nothing: it has no ramp and keeps the Hard transition, its region
+// building its own shell, whatever (n, T) it has.
 //
 // Each zone has a top and a bottom profile, which ramp independently: one distance solve serves both. Each carries its
 // own (n0, T0), because one modifier can overlap several parts with different shells, and its piece on each part
@@ -69,6 +75,10 @@ struct ShellRule
     double layers { 0. };
     // T in mm, 0 where n is.
     double thickness { 0. };
+    // The shell of the thinner end of a ramp, which holds across all of it whatever n and T are: a layer in it is in
+    // the shell too.
+    double floor_layers { 0. };
+    double floor_thickness { 0. };
 
     // Whether the layer k layers from the surface, dz from it in Z, is in the shell.
     bool solid(size_t k, double dz) const;

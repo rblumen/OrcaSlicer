@@ -716,9 +716,13 @@ void PrintObject::prepare_infill()
         return;
     m_print->set_status(25, L("Generating infill regions"));
 
-    // Orca: A modifier whose shell transition is Ramp but whose taper ratio is 0 keeps the hard step at its outline.
-    // Warn about that, unless the modifier does not change the depth of the shell it modifies.
+    // Orca: A modifier whose shell transition is Ramp but which keeps the hard step at its outline, for a taper ratio of 0
+    // or a shell as deep as the one it modifies at the nominal layer height, builds its own shell. Warn about that,
+    // unless its shell is the one it modifies, which nothing changes.
     const double layer_height = m_config.layer_height.value;
+    auto shell_differs = [](int layers, double thickness, int base_layers, double base_thickness) {
+        return layers != base_layers || (layers > 0 && std::abs(thickness - base_thickness) > EPSILON);
+    };
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges)
         for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
             if (volume_region.parent < 0 || volume_region.region == layer_range.volume_regions[volume_region.parent].region)
@@ -726,12 +730,10 @@ void PrintObject::prepare_infill()
             const PrintRegion       &modifier = *volume_region.region;
             const PrintRegionConfig &config   = modifier.config();
             const RampKey           &key      = modifier.ramp_key();
-            const bool top_falls_back    = key.top_base_layers >= 0 && ! modifier.has_top_shell_ramp() &&
-                std::abs(shell_depth(config.top_shell_layers.value, config.top_shell_thickness.value, layer_height) -
-                         shell_depth(key.top_base_layers, key.top_base_thickness, layer_height)) > EPSILON;
-            const bool bottom_falls_back = key.bottom_base_layers >= 0 && ! modifier.has_bottom_shell_ramp() &&
-                std::abs(shell_depth(config.bottom_shell_layers.value, config.bottom_shell_thickness.value, layer_height) -
-                         shell_depth(key.bottom_base_layers, key.bottom_base_thickness, layer_height)) > EPSILON;
+            const bool top_falls_back    = key.top_base_layers >= 0 && ! modifier.has_top_shell_ramp(layer_height) &&
+                shell_differs(config.top_shell_layers.value, config.top_shell_thickness.value, key.top_base_layers, key.top_base_thickness);
+            const bool bottom_falls_back = key.bottom_base_layers >= 0 && ! modifier.has_bottom_shell_ramp(layer_height) &&
+                shell_differs(config.bottom_shell_layers.value, config.bottom_shell_thickness.value, key.bottom_base_layers, key.bottom_base_thickness);
             if (! top_falls_back && ! bottom_falls_back)
                 continue;
             // A modifier overlapping only the bounding box of the region has nothing to ramp.
@@ -742,13 +744,13 @@ void PrintObject::prepare_infill()
                 this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                     // TRN: %1% is the name of a modifier, %2% the name of an object.
                     Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard top shell count transition: the Ramp transition needs "
-                                        "a taper ratio above 0."),
+                                        "a taper ratio above 0 and a change in the shell depth."),
                                    volume_region.model_volume->name, this->model_object()->name));
             if (bottom_falls_back)
                 this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                     // TRN: %1% is the name of a modifier, %2% the name of an object.
                     Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard bottom shell count transition: the Ramp transition "
-                                        "needs a taper ratio above 0."),
+                                        "needs a taper ratio above 0 and a change in the shell depth."),
                                    volume_region.model_volume->name, this->model_object()->name));
         }
 

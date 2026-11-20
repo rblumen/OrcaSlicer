@@ -37,7 +37,10 @@ double shell_depth(int layers, double thickness, double layer_height)
 }
 
 // As the stock projection, see PrintObject::discover_vertical_shells() and discover_horizontal_shells().
-bool ShellRule::solid(size_t k, double dz) const { return double(k) < layers || dz < thickness - EPSILON; }
+bool ShellRule::solid(size_t k, double dz) const
+{
+    return double(k) < layers || dz < thickness - EPSILON || double(k) < floor_layers || dz < floor_thickness - EPSILON;
+}
 
 bool ShellRampProfile::active() const { return taper_ratio > 0. && std::abs(this->depth() - this->base_depth()) > EPSILON; }
 
@@ -50,7 +53,10 @@ ShellRule ShellRampProfile::at(double distance) const
         return base;
     const ShellRule in { double(std::max(layers, 0)), layers > 0 ? thickness : 0. };
     const double    t = std::clamp(distance / this->ramp_length(), 0., 1.);
-    return { in.layers + (base.layers - in.layers) * t, in.thickness + (base.thickness - in.thickness) * t };
+    // Interpolating n and T separately can put fewer layers in the shell than both ends do when they move in opposite
+    // directions, so the thinner end's shell is held across the whole ramp.
+    const ShellRule &thinner = this->thickens() ? base : in;
+    return { in.layers + (base.layers - in.layers) * t, in.thickness + (base.thickness - in.thickness) * t, thinner.layers, thinner.thickness };
 }
 
 namespace {
@@ -316,7 +322,10 @@ Polygons contour(const marchsq::ShellRaster &raster, const std::vector<float> &g
 // the rounding of the raster does not put the layer in.
 float shell_margin(const ShellRule &rule, size_t k, double dz, double layer_height)
 {
-    return float(std::max(rule.layers - double(k) - 1e-3, (rule.thickness - dz - EPSILON) / layer_height));
+    auto margin = [k, dz, layer_height](double layers, double thickness) {
+        return std::max(layers - double(k) - 1e-3, layer_height > 0. ? (thickness - dz - EPSILON) / layer_height : -std::numeric_limits<double>::infinity());
+    };
+    return float(std::max(margin(rule.layers, rule.thickness), margin(rule.floor_layers, rule.floor_thickness)));
 }
 
 ShellLevels threshold(const ShellDepthField &field, const marchsq::ShellRaster &raster, ShellSide side, const std::vector<double> &offsets)

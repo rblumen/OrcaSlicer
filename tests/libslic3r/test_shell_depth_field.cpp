@@ -350,3 +350,63 @@ TEST_CASE("The shell depth is the layer count's depth, at least the minimum thic
     CHECK_THAT(shell_depth(3, 1., 0.2), WithinAbs(1., 1e-9));
     CHECK_THAT(shell_depth(0, 1., 0.2), WithinAbs(0., 1e-9));
 }
+
+// From 5 layers to 2 layers of at least 1.4 mm: 1.0 mm to 1.4 mm deep, a ramp of 0.4 mm * 10 = 4 mm. Interpolating n
+// and T apart gives n(d) = 2 + 0.75 d and T(d) = 1.4 - 0.35 d, which at d = 2 is 3.5 layers and 0.7 mm: 4 layers, fewer
+// than the 5 of both ends' shells at 0.2 mm layers (7 inside). The thinner end's 5 layers hold all along the ramp.
+TEST_CASE("A ramp whose layers and thickness move in opposite directions never has fewer layers than its thinner end", "[ShellDepthField]")
+{
+    const ShellRampProfile opposite { 5, 0., 2, 1.4, 10., H };
+    REQUIRE(opposite.active());
+    REQUIRE(opposite.thickens());
+
+    const auto field = build_on_slab({ zone(modifier(15., 25., 2., 6.), opposite) });
+    REQUIRE(field != nullptr);
+    CHECK(top_layers(*field, 20.) == std::optional<size_t>(7));
+    // d = 1 from the zone's edge, where T(d) = 1.05 mm alone has 6 layers, more than the 5 held.
+    CHECK(top_layers(*field, 14.) == std::optional<size_t>(6));
+    // d = 2 to 3, where the interpolated rule alone has 4 layers.
+    for (const double x : { 13., 12.5, 27., 28. }) {
+        CAPTURE(x);
+        CHECK(top_layers(*field, x) == std::optional<size_t>(5));
+    }
+    // The rule itself, at t = 0.5.
+    CHECK(opposite.at(2.).solid(4, 0.8));
+    CHECK_FALSE(opposite.at(2.).solid(5, 1.));
+
+    // The levels: layers 0 to 4 are in the shell over the whole reach, with no gap in the middle of the ramp.
+    const BoundingBox      extents(Point::new_scale(0., 0.), Point::new_scale(40., 20.));
+    const LayerShellLevels levels = make_layer_shell_levels(*field, extents, TOP_Z, uniform_offsets(11), uniform_offsets(11));
+    REQUIRE(levels.top.level.size() == 7);
+    for (size_t k = 0; k < 5; ++ k) {
+        CAPTURE(k);
+        CHECK(area_mm2(diff(levels.top.reach, levels.top.level[k])) < 1e-3);
+    }
+}
+
+// The base shell is 5 layers with a 0.4 mm minimum, the zone's 2 layers with a 1.4 mm minimum, under layers 0.28 mm
+// apart: 5 layers at the ramp's end, and inside the zone k < 2 or 0.28 k < 1.4, 5 layers too. The levels hold the
+// thickness through the raster: where n(d) and T(d) alone give 4 layers mid-ramp the 5 still hold.
+TEST_CASE("The shell levels of a ramp with a minimum thickness at the base count the layers at the end of the ramp", "[ShellDepthField]")
+{
+    const ShellRampProfile base_thick { 5, 0.4, 2, 1.4, 10., H };
+    REQUIRE(base_thick.active());
+    const auto field = build_on_slab({ zone(modifier(15., 25., 2., 6.), base_thick) });
+    REQUIRE(field != nullptr);
+
+    std::vector<double> offsets;
+    for (size_t k = 0; k < 9; ++ k)
+        offsets.emplace_back(0.28 * double(k));
+    const BoundingBox      extents(Point::new_scale(0., 0.), Point::new_scale(40., 20.));
+    const LayerShellLevels levels = make_layer_shell_levels(*field, extents, TOP_Z, offsets, offsets);
+    const ShellLevels     &top    = levels.top;
+    REQUIRE_FALSE(top.empty());
+    REQUIRE(top.level.size() == 5);
+    CHECK(top.at(5).empty());
+    for (size_t k = 0; k < 5; ++ k) {
+        CAPTURE(k);
+        // The base's layers cover the whole reach, to the end of the ramp, where stock takes over.
+        CHECK(area_mm2(diff(top.reach, top.level[k])) < 1e-3);
+        CHECK(area_mm2(diff(top.level[k], top.reach)) < 1e-3);
+    }
+}

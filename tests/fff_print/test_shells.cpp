@@ -209,11 +209,11 @@ TEST_CASE("A modifier on the Ramp shell transitions is keyed to the shell counts
     // The walls are not on the Ramp.
     CHECK(key.wall_base == -1);
     CHECK_FALSE(modifier->has_wall_ramp());
-    CHECK(modifier->has_top_shell_ramp());
-    CHECK(modifier->has_bottom_shell_ramp());
+    CHECK(modifier->has_top_shell_ramp(0.2));
+    CHECK(modifier->has_bottom_shell_ramp(0.2));
     CHECK(modifier->config().bottom_shell_layers.value == 5);
 
-    const ShellCounts counts = modifier->shell_default_counts();
+    const ShellCounts counts = modifier->shell_default_counts(0.2);
     CHECK(counts.top_layers == 3);
     CHECK_THAT(counts.top_thickness, Catch::Matchers::WithinAbs(0.4, 1e-9));
     CHECK(counts.bottom_layers == 3);
@@ -239,16 +239,16 @@ TEST_CASE("Each shell transition keys only its own shell", "[Shells][ShellRamp]"
 
     const PrintRegion *modifier = region_with_top_shell_layers(print, 5);
     REQUIRE(modifier != nullptr);
-    CHECK(modifier->has_top_shell_ramp() == top_ramp);
-    CHECK(modifier->has_bottom_shell_ramp() == bottom_ramp);
-    const ShellCounts counts = modifier->shell_default_counts();
+    CHECK(modifier->has_top_shell_ramp(0.2) == top_ramp);
+    CHECK(modifier->has_bottom_shell_ramp(0.2) == bottom_ramp);
+    const ShellCounts counts = modifier->shell_default_counts(0.2);
     CHECK(counts.top_layers == (top_ramp ? 3 : 5));
     CHECK(counts.bottom_layers == (bottom_ramp ? 3 : 5));
     // The part is never keyed and builds its own shell.
     const PrintRegion *part = region_with_top_shell_layers(print, 3);
     REQUIRE(part != nullptr);
     CHECK(part->ramp_key() == RampKey{});
-    CHECK(part->shell_default_counts().top_layers == 3);
+    CHECK(part->shell_default_counts(0.2).top_layers == 3);
 }
 
 // The same modifier config over parts with 3 and 4 top layers would otherwise make one region, losing the count the
@@ -505,25 +505,59 @@ TEST_CASE("A modifier on the Ramp wall and shell transitions is keyed for both",
     CHECK_THAT(both.bottom_base_thickness, Catch::Matchers::WithinAbs(0.2, 1e-9));
 }
 
-// The part's top shell is 3 layers with a 0.4 mm minimum and its bottom shell 3 layers with a 0.2 mm minimum, both
-// 0.6 mm deep at 0.2 mm layers. A modifier on the Ramp with a taper ratio of 0 that keeps that depth, through 2 layers
-// and a 0.6 mm minimum, changes nothing and does not warn.
-TEST_CASE("A modifier on the Ramp shell transition with a taper ratio of 0 keeping the shell's depth does not warn", "[Shells][ShellRamp]")
+// The part's top shell is 3 layers with a 0.4 mm minimum and its bottom shell 3 layers with a 0.2 mm minimum. A modifier
+// on the Ramp with a taper ratio of 0 that sets those same shells changes nothing and does not warn.
+TEST_CASE("A modifier on the Ramp shell transition with a taper ratio of 0 keeping the shell does not warn", "[Shells][ShellRamp]")
 {
-    struct Variant { const char *transition_key; const char *taper_key; const char *count_key; const char *thickness_key; };
+    struct Variant { const char *transition_key; const char *taper_key; const char *count_key; const char *thickness_key; double thickness; };
     const Variant variant = GENERATE(
-        Variant{ "top_shell_layers_transition",    "top_shell_ramp_taper_ratio",    "top_shell_layers",    "top_shell_thickness" },
-        Variant{ "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio", "bottom_shell_layers", "bottom_shell_thickness" });
+        Variant{ "top_shell_layers_transition",    "top_shell_ramp_taper_ratio",    "top_shell_layers",    "top_shell_thickness",    0.4 },
+        Variant{ "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio", "bottom_shell_layers", "bottom_shell_thickness", 0.2 });
     CAPTURE(variant.transition_key);
 
     Print print;
     Model model;
     slice_parts_with_modifiers(print, model, shell_config(), one_part,
                                { modifier_box(15., 25., part_config({ { variant.transition_key, "ramp" }, { variant.taper_key, 0. },
-                                                                      { variant.count_key, 2 }, { variant.thickness_key, 0.6 } })) });
+                                                                      { variant.count_key, 3 }, { variant.thickness_key, variant.thickness } })) });
     const std::string warnings = prepare_infill_warnings(print);
     CAPTURE(warnings);
     CHECK(warnings.empty());
+}
+
+// The part's shells are 0.6 mm deep at 0.2 mm layers, 3 layers with a minimum of 0.4 mm on top and 0.2 mm at the bottom.
+// A modifier setting 2 layers with a 0.6 mm minimum is as deep at the nominal layer height, yet is 3 layers under
+// thinner ones: it has no ramp, builds its own shell and says it keeps the hard step, whatever its taper ratio.
+TEST_CASE("A modifier on the Ramp shell transition as deep as the shell it modifies but set differently falls back to Hard and warns", "[Shells][ShellRamp]")
+{
+    struct Variant { const char *transition_key; const char *taper_key; const char *count_key; const char *thickness_key; const char *direction; };
+    const Variant variant = GENERATE(
+        Variant{ "top_shell_layers_transition",    "top_shell_ramp_taper_ratio",    "top_shell_layers",    "top_shell_thickness",    "top" },
+        Variant{ "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio", "bottom_shell_layers", "bottom_shell_thickness", "bottom" });
+    const double taper_ratio = GENERATE(0., 5.);
+    CAPTURE(variant.transition_key, taper_ratio);
+
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, shell_config(), one_part,
+                               { modifier_box(15., 25., part_config({ { variant.transition_key, "ramp" }, { variant.taper_key, taper_ratio },
+                                                                      { variant.count_key, 2 }, { variant.thickness_key, 0.6 } })) });
+    const PrintObject &object   = *print.objects().front();
+    const PrintRegion *modifier = nullptr;
+    for (size_t i = 0; i < object.num_printing_regions(); ++ i)
+        if (const RampKey &key = object.printing_region(i).ramp_key(); key.top_base_layers >= 0 || key.bottom_base_layers >= 0)
+            modifier = &object.printing_region(i);
+    REQUIRE(modifier != nullptr);
+    CHECK_FALSE(modifier->has_top_shell_ramp(0.2));
+    CHECK_FALSE(modifier->has_bottom_shell_ramp(0.2));
+    // The region keeps its own counts, not those of the part.
+    const ShellCounts counts = modifier->shell_default_counts(0.2);
+    CHECK(counts.top_layers == (std::string(variant.direction) == "top" ? 2 : 3));
+    CHECK(counts.bottom_layers == (std::string(variant.direction) == "top" ? 3 : 2));
+
+    const std::string warnings = prepare_infill_warnings(print);
+    CAPTURE(warnings);
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring(std::string("Hard ") + variant.direction + " shell count transition"));
 }
 
 // The part keyed by its top shell count in two height ranges, 3 layers below z = 1 and 4 above, gives the modifier no
