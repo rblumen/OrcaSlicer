@@ -26,6 +26,7 @@
 #include "Support/SupportSpotsGenerator.hpp"
 #include "Support/TreeSupport.hpp"
 #include "Surface.hpp"
+#include "ShellDepthField.hpp"
 #include "Slicing.hpp"
 #include "Tesselate.hpp"
 #include "TriangleMeshSlicer.hpp"
@@ -716,7 +717,8 @@ void PrintObject::prepare_infill()
     m_print->set_status(25, L("Generating infill regions"));
 
     // Orca: A modifier whose shell transition is Ramp but whose taper ratio is 0 keeps the hard step at its outline.
-    // Warn about that, unless the modifier does not change the shell it modifies.
+    // Warn about that, unless the modifier does not change the depth of the shell it modifies.
+    const double layer_height = m_config.layer_height.value;
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges)
         for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
             if (volume_region.parent < 0 || volume_region.region == layer_range.volume_regions[volume_region.parent].region)
@@ -725,9 +727,11 @@ void PrintObject::prepare_infill()
             const PrintRegionConfig &config   = modifier.config();
             const RampKey           &key      = modifier.ramp_key();
             const bool top_falls_back    = key.top_base_layers >= 0 && ! modifier.has_top_shell_ramp() &&
-                (config.top_shell_layers.value != key.top_base_layers || config.top_shell_thickness.value != key.top_base_thickness);
+                std::abs(shell_depth(config.top_shell_layers.value, config.top_shell_thickness.value, layer_height) -
+                         shell_depth(key.top_base_layers, key.top_base_thickness, layer_height)) > EPSILON;
             const bool bottom_falls_back = key.bottom_base_layers >= 0 && ! modifier.has_bottom_shell_ramp() &&
-                (config.bottom_shell_layers.value != key.bottom_base_layers || config.bottom_shell_thickness.value != key.bottom_base_thickness);
+                std::abs(shell_depth(config.bottom_shell_layers.value, config.bottom_shell_thickness.value, layer_height) -
+                         shell_depth(key.bottom_base_layers, key.bottom_base_thickness, layer_height)) > EPSILON;
             if (! top_falls_back && ! bottom_falls_back)
                 continue;
             // A modifier overlapping only the bounding box of the region has nothing to ramp.
@@ -747,6 +751,21 @@ void PrintObject::prepare_infill()
                                         "needs a taper ratio above 0."),
                                    volume_region.model_volume->name, this->model_object()->name));
         }
+
+    // Orca: the depth of the shells of modifiers with a ramped shell transition, see ShellDepthField.hpp. A modifier whose
+    // shell settings differ between height ranges gets no zone.
+    std::shared_ptr<const ShellDepthField> shell_depth_field;
+    if (shell_ramp_active(m_print->config())) {
+        std::vector<const ModelVolume*> inconsistent_modifiers;
+        shell_depth_field = build_shell_depth_field(*this, &inconsistent_modifiers);
+        for (const ModelVolume *modifier : inconsistent_modifiers)
+            this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
+                // TRN: %1% is the name of a modifier, %2% the name of an object.
+                Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard shell count transitions: the Ramp transitions need "
+                                    "the same shell settings in every height range."),
+                               modifier->name, this->model_object()->name));
+    }
+    m_print->throw_if_canceled();
 
     if (m_typed_slices) {
         // To improve robustness of detect_surfaces_type() when reslicing (working with typed slices), see GH issue #7442.

@@ -445,6 +445,8 @@ set(lisbslic3r_sources
     QuadricEdgeCollapse.cpp
     QuadricEdgeCollapse.hpp
     Semver.cpp
+    ShellDepthField.cpp
+    ShellDepthField.hpp
     ShortEdgeCollapse.cpp
     ShortEdgeCollapse.hpp
     ShortestPath.cpp
