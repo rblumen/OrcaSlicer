@@ -20,6 +20,7 @@
 #include "Point.hpp"
 #include "PrintConfig.hpp"
 #include "Slicing.hpp"
+#include "ShellDepthField.hpp"
 #include "TriangleMesh.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "GCode/ToolOrdering.hpp"
@@ -219,21 +220,30 @@ public:
     // Orca: The wall count of the walls this region shares. Regions share walls only when these agree, which for
     // regions without a ramp is the plain equality of their wall counts.
     int                         wall_group_loops() const throw() { return this->has_wall_ramp() ? m_ramp_key.wall_root : m_config.wall_loops.value; }
-    // Orca: Whether the top (bottom) shell of this modifier region ramps from the shell of the region it modifies. A
-    // taper ratio of 0 keeps the hard step.
-    bool                        has_top_shell_ramp() const throw() { return m_ramp_key.top_base_layers >= 0 && m_config.top_shell_ramp_taper_ratio.value > 0.; }
-    bool                        has_bottom_shell_ramp() const throw() { return m_ramp_key.bottom_base_layers >= 0 && m_config.bottom_shell_ramp_taper_ratio.value > 0.; }
+    // Orca: Whether the top (bottom) shell of this modifier region ramps from the shell of the region it modifies, at the
+    // nominal layer height. A taper ratio of 0, or a shell as deep as the one it modifies, keeps the hard step: the
+    // region builds its own shell. See ShellRampProfile::active().
+    bool                        has_top_shell_ramp(double layer_height) const throw() {
+        return m_ramp_key.top_base_layers >= 0 && m_config.top_shell_ramp_taper_ratio.value > 0. &&
+            std::abs(shell_depth(m_config.top_shell_layers.value, m_config.top_shell_thickness.value, layer_height) -
+                     shell_depth(m_ramp_key.top_base_layers, m_ramp_key.top_base_thickness, layer_height)) > EPSILON;
+    }
+    bool                        has_bottom_shell_ramp(double layer_height) const throw() {
+        return m_ramp_key.bottom_base_layers >= 0 && m_config.bottom_shell_ramp_taper_ratio.value > 0. &&
+            std::abs(shell_depth(m_config.bottom_shell_layers.value, m_config.bottom_shell_thickness.value, layer_height) -
+                     shell_depth(m_ramp_key.bottom_base_layers, m_ramp_key.bottom_base_thickness, layer_height)) > EPSILON;
+    }
     // Orca: The shell counts this region's shells are built with where no Shell Ramp zone decides: for a shell on the
     // Ramp, those of the region the modifier modifies, so that its depth only changes where the ramp says so; otherwise
     // the region's own.
-    ShellCounts                 shell_default_counts() const throw() {
+    ShellCounts                 shell_default_counts(double layer_height) const throw() {
         ShellCounts counts { m_config.top_shell_layers.value, m_config.top_shell_thickness.value,
                              m_config.bottom_shell_layers.value, m_config.bottom_shell_thickness.value };
-        if (this->has_top_shell_ramp()) {
+        if (this->has_top_shell_ramp(layer_height)) {
             counts.top_layers    = m_ramp_key.top_base_layers;
             counts.top_thickness = m_ramp_key.top_base_thickness;
         }
-        if (this->has_bottom_shell_ramp()) {
+        if (this->has_bottom_shell_ramp(layer_height)) {
             counts.bottom_layers    = m_ramp_key.bottom_base_layers;
             counts.bottom_thickness = m_ramp_key.bottom_base_thickness;
         }
