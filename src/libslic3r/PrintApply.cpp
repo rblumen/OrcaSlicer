@@ -822,16 +822,32 @@ void print_region_ref_inc(PrintRegion &r) { ++ r.m_ref_cnt; }
 void print_region_ref_reset(PrintRegion &r) { r.m_ref_cnt = 0; }
 int  print_region_ref_cnt(const PrintRegion &r) { return r.m_ref_cnt; }
 
-// Orca: PrintRegion::wall_ramp_key() of the region of the modifier `volume` over `parent`. Only a modifier setting the
-// Ramp transition itself has one: the transition is not inherited from the process, the object, a layer range or an
-// enclosing modifier. Only Arachne walls follow the ramp and spiral vase mode builds none, so when the transition is not
-// active (wall_ramp_active()) the modifier keeps the Hard transition: its region is not keyed and walls its own outline,
-// see Print::validate().
-static WallRampKey wall_ramp_key(const ModelVolume &volume, const PrintRegion &parent, bool wall_ramp_enabled)
+// Orca: PrintRegion::ramp_key() of the region of the modifier `volume` over `parent`. Each part of the key is set only
+// for a transition the modifier sets to Ramp itself: the transitions are not inherited from the process, the object, a
+// layer range or an enclosing modifier. Only Arachne walls follow the wall ramp and spiral vase mode builds none, so when
+// the wall transition is not active (wall_ramp_active()) the modifier keeps the Hard wall transition: its region is not
+// keyed for walls and walls its own outline, see Print::validate(). Likewise for the shells and shell_ramp_active().
+static RampKey ramp_key(const ModelVolume &volume, const PrintRegion &parent, bool wall_ramp_enabled, bool shell_ramp_enabled)
 {
-    const ConfigOption *transition = volume.config.option("wall_loops_transition");
-    return wall_ramp_enabled && transition != nullptr && transition->getInt() == int(WallLoopsTransition::Ramp) ?
-        WallRampKey{ parent.config().wall_loops.value, parent.wall_group_loops() } : WallRampKey{};
+    auto is_ramp = [&volume](const char *opt_key) {
+        const ConfigOption *transition = volume.config.option(opt_key);
+        return transition != nullptr && transition->getInt() == int(CountTransition::Ramp);
+    };
+    const PrintRegionConfig &parent_config = parent.config();
+    RampKey key;
+    if (wall_ramp_enabled && is_ramp("wall_loops_transition")) {
+        key.wall_base = parent_config.wall_loops.value;
+        key.wall_root = parent.wall_group_loops();
+    }
+    if (shell_ramp_enabled && is_ramp("top_shell_layers_transition")) {
+        key.top_base_layers    = parent_config.top_shell_layers.value;
+        key.top_base_thickness = parent_config.top_shell_thickness.value;
+    }
+    if (shell_ramp_enabled && is_ramp("bottom_shell_layers_transition")) {
+        key.bottom_base_layers    = parent_config.bottom_shell_layers.value;
+        key.bottom_base_thickness = parent_config.bottom_shell_thickness.value;
+    }
+    return key;
 }
 
 // Verify whether the PrintRegions of a PrintObject are still valid, possibly after updating the region configs.
@@ -844,8 +860,10 @@ bool verify_update_print_object_regions(
     PrintObjectRegions                 &print_object_regions,
     const std::function<void(const PrintRegionConfig&, const PrintRegionConfig&, const t_config_option_keys&)> &callback_invalidate,
     std::vector<int>& variant_index,
-    // Orca: whether the Ramp transition is active for the object, see wall_ramp_active().
-    bool wall_ramp_enabled)
+    // Orca: whether the Ramp wall and shell transitions are active for the object, see wall_ramp_active() and
+    // shell_ramp_active().
+    bool wall_ramp_enabled,
+    bool shell_ramp_enabled)
 {
     // Sort by ModelVolume ID.
     model_volumes_sort_by_id(model_volumes);
@@ -902,8 +920,9 @@ bool verify_update_print_object_regions(
                     region_config_from_model_volume(layer_range.volume_regions[region.parent].region->config(), nullptr, **it_model_volume, num_extruders, variant_index);
                 // Orca: A modifier that does not modify its parent shares the parent's region and keeps its key.
                 const PrintRegion *parent = region.parent == -1 ? nullptr : layer_range.volume_regions[region.parent].region;
-                const WallRampKey key = parent == nullptr || parent == region.region ? region.region->wall_ramp_key() : wall_ramp_key(**it_model_volume, *parent, wall_ramp_enabled);
-                if (cfg != region.region->config() || key != region.region->wall_ramp_key()) {
+                const RampKey key = parent == nullptr || parent == region.region ? region.region->ramp_key() :
+                    ramp_key(**it_model_volume, *parent, wall_ramp_enabled, shell_ramp_enabled);
+                if (cfg != region.region->config() || key != region.region->ramp_key()) {
                     // Region configuration changed.
                     if (print_region_ref_cnt(*region.region) == 0) {
                         // Region is referenced for the first time. Just change its parameters.
@@ -911,7 +930,7 @@ bool verify_update_print_object_regions(
                         t_config_option_keys diff = region.region->config().diff(cfg);
                         callback_invalidate(region.region->config(), cfg, diff);
                         region.region->config_apply_only(cfg, diff, false);
-                        region.region->set_wall_ramp_key(key);
+                        region.region->set_ramp_key(key);
                     } else {
                         // Region is referenced multiple times, thus the region is being split. We need to reslice.
                         return false;
@@ -932,8 +951,8 @@ bool verify_update_print_object_regions(
             cfg.top_surface_filament_id.value = region.extruder_id;
             cfg.bottom_surface_filament_id.value = region.extruder_id;
             cfg.sparse_infill_filament_id.value       = region.extruder_id;
-            const WallRampKey &key = parent_region.region->wall_ramp_key();
-            if (cfg != region.region->config() || key != region.region->wall_ramp_key()) {
+            const RampKey &key = parent_region.region->ramp_key();
+            if (cfg != region.region->config() || key != region.region->ramp_key()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
                     // Region is referenced for the first time. Just change its parameters.
@@ -941,7 +960,7 @@ bool verify_update_print_object_regions(
                     t_config_option_keys diff = region.region->config().diff(cfg);
                     callback_invalidate(region.region->config(), cfg, diff);
                     region.region->config_apply_only(cfg, diff, false);
-                    region.region->set_wall_ramp_key(key);
+                    region.region->set_ramp_key(key);
                 } else {
                     // Region is referenced multiple times, thus the region is being split. We need to reslice.
                     return false;
@@ -956,8 +975,8 @@ bool verify_update_print_object_regions(
             const PrintRegion &parent_print_region = *region.parent_print_object_region(layer_range);
             PrintRegionConfig  cfg                 = parent_print_region.config();
             if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
-            const WallRampKey &key = parent_print_region.wall_ramp_key();
-            if (cfg != region.region->config() || key != region.region->wall_ramp_key()) {
+            const RampKey &key = parent_print_region.ramp_key();
+            if (cfg != region.region->config() || key != region.region->ramp_key()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
                     // Region is referenced for the first time. Just change its parameters.
@@ -965,7 +984,7 @@ bool verify_update_print_object_regions(
                     t_config_option_keys diff = region.region->config().diff(cfg);
                     callback_invalidate(region.region->config(), cfg, diff);
                     region.region->config_apply_only(cfg, diff, false);
-                    region.region->set_wall_ramp_key(key);
+                    region.region->set_ramp_key(key);
                 } else {
                     // Region is referenced multiple times, thus the region is being split. We need to reslice.
                     return false;
@@ -994,7 +1013,7 @@ bool verify_update_print_object_regions(
                 // true and behavior matches the legacy check.
                 if (regions[i]->config() == regions[j]->config()
                     && regions[i]->gradient_volume_id() == regions[j]->gradient_volume_id()
-                    && regions[i]->wall_ramp_key() == regions[j]->wall_ramp_key()) {
+                    && regions[i]->ramp_key() == regions[j]->ramp_key()) {
                     // Regions were merged. We need to reslice.
                     return false;
                 }
@@ -1087,8 +1106,10 @@ static PrintObjectRegions* generate_print_object_regions(
     const std::vector<unsigned int>             &painting_extruders,
     std::vector<int>                            &variant_index,
     const bool                                   has_painted_fuzzy_skin,
-    // Orca: whether the Ramp transition is active for the object, see wall_ramp_active().
+    // Orca: whether the Ramp wall and shell transitions are active for the object, see wall_ramp_active() and
+    // shell_ramp_active().
     const bool                                   wall_ramp_enabled,
+    const bool                                   shell_ramp_enabled,
     // Per-part gradient: slot_per_part_enabled[s-1] is true when mixed slot s has
     // filament_mixed_gradient_per_part on. Empty / all-false preserves legacy behavior.
     const std::vector<bool>                     &slot_per_part_enabled = {})
@@ -1136,19 +1157,19 @@ static PrintObjectRegions* generate_print_object_regions(
     // keys the region to one ModelVolume so two volumes with identical settings still get
     // separate regions — needed so each part can run its own gradient. A default (invalid)
     // tag reproduces the previous lookup exactly.
-    // Orca: wall_ramp_key keys the region of a modifier with a ramped transition to the walls of its parent, see
-    // PrintRegion::wall_ramp_key(). The default key reproduces the previous lookup exactly.
-    auto get_create_region = [&region_set, &all_regions](PrintRegionConfig &&config, ObjectID volume_tag = ObjectID(), WallRampKey wall_ramp_key = {}) -> PrintRegion* {
+    // Orca: the key keeps the region of a modifier with a ramped transition apart by the counts of its parent, see
+    // PrintRegion::ramp_key(). The default key reproduces the previous lookup exactly.
+    auto get_create_region = [&region_set, &all_regions](PrintRegionConfig &&config, ObjectID volume_tag = ObjectID(), RampKey key = {}) -> PrintRegion* {
         size_t hash = config.hash();
-        auto it = Slic3r::lower_bound_by_predicate(region_set.begin(), region_set.end(), [&config, hash, volume_tag, &wall_ramp_key](const PrintRegion* l) {
+        auto it = Slic3r::lower_bound_by_predicate(region_set.begin(), region_set.end(), [&config, hash, volume_tag, &key](const PrintRegion* l) {
             return l->config_hash() < hash || (l->config_hash() == hash && l->config() < config)
                 || (l->config_hash() == hash && l->config() == config && l->gradient_volume_id() < volume_tag)
-                || (l->config_hash() == hash && l->config() == config && l->gradient_volume_id() == volume_tag && l->wall_ramp_key() < wall_ramp_key); });
+                || (l->config_hash() == hash && l->config() == config && l->gradient_volume_id() == volume_tag && l->ramp_key() < key); });
         if (it != region_set.end() && (*it)->config_hash() == hash && (*it)->config() == config
-            && (*it)->gradient_volume_id() == volume_tag && (*it)->wall_ramp_key() == wall_ramp_key)
+            && (*it)->gradient_volume_id() == volume_tag && (*it)->ramp_key() == key)
             return *it;
         // Insert into a sorted array, it has O(n) complexity, but the calling algorithm has an O(n^2*log(n)) complexity anyways.
-        all_regions.emplace_back(std::make_unique<PrintRegion>(std::move(config), hash, int(all_regions.size()), volume_tag, wall_ramp_key));
+        all_regions.emplace_back(std::make_unique<PrintRegion>(std::move(config), hash, int(all_regions.size()), volume_tag, key));
         PrintRegion *region = all_regions.back().get();
         region_set.emplace(it, region);
         return region;
@@ -1232,7 +1253,7 @@ static PrintObjectRegions* generate_print_object_regions(
                                     if (PrintRegionConfig config = region_config_from_model_volume(parent_region.region->config(), nullptr, volume, num_extruders, variant_index);
                                         config != parent_region.region->config()) {
                                         added = true;
-                                        const WallRampKey key = wall_ramp_key(volume, *parent_region.region, wall_ramp_enabled);
+                                        const RampKey key = ramp_key(volume, *parent_region.region, wall_ramp_enabled, shell_ramp_enabled);
                                         layer_range.volume_regions.push_back({ &volume, parent_region_id, get_create_region(std::move(config), ObjectID(), key), bbox });
                                     } else if (parent_model_part_id == -1 && parent_volume.is_model_part())
                                         parent_model_part_id = parent_region_id;
@@ -1261,7 +1282,7 @@ static PrintObjectRegions* generate_print_object_regions(
                     cfg.bottom_surface_filament_id.value = painted_extruder_id;
                     cfg.sparse_infill_filament_id.value       = painted_extruder_id;
                     layer_range.painted_regions.push_back({ painted_extruder_id, parent_region_id,
-                        get_create_region(std::move(cfg), ObjectID(), parent_region.region->wall_ramp_key()) });
+                        get_create_region(std::move(cfg), ObjectID(), parent_region.region->ramp_key()) });
                 }
         // Sort the regions by parent region::print_object_region_id() and extruder_id to help the slicing algorithm when applying MM segmentation.
         std::sort(layer_range.painted_regions.begin(), layer_range.painted_regions.end(), [&layer_range](auto &l, auto &r) {
@@ -1281,7 +1302,7 @@ static PrintObjectRegions* generate_print_object_regions(
                     PrintRegionConfig cfg = parent_volume_region.region->config();
                     if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
                     layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::VolumeRegion, parent_volume_region_id,
-                        get_create_region(std::move(cfg), ObjectID(), parent_volume_region.region->wall_ramp_key())});
+                        get_create_region(std::move(cfg), ObjectID(), parent_volume_region.region->ramp_key())});
                 }
             }
 
@@ -1291,7 +1312,7 @@ static PrintObjectRegions* generate_print_object_regions(
                 PrintRegionConfig cfg = parent_painted_region.region->config();
                 if (cfg.fuzzy_skin.value != FuzzySkinType::Disabled_fuzzy) cfg.fuzzy_skin.value = FuzzySkinType::All;
                 layer_range.fuzzy_skin_painted_regions.push_back({FuzzySkinParentType::PaintedRegion, parent_painted_regions_id,
-                    get_create_region(std::move(cfg), ObjectID(), parent_painted_region.region->wall_ramp_key())});
+                    get_create_region(std::move(cfg), ObjectID(), parent_painted_region.region->ramp_key())});
             }
 
             // Sort the regions by parent region::print_object_region_id() to help the slicing algorithm when applying fuzzy skin segmentation.
@@ -2161,6 +2182,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         PrintObjectRegions *print_object_regions = model_object_status.print_object_regions;
         // Orca: the object's config and the print's are already up to date; a change of the wall generator or of spiral vase mode reslices the object.
         const bool          wall_ramp_enabled    = wall_ramp_active(m_config, print_object.config());
+        const bool          shell_ramp_enabled   = shell_ramp_active(m_config);
         for (++ it_print_object_end; it_print_object_end != m_objects.end() && (*it_print_object)->model_object() == (*it_print_object_end)->model_object(); ++ it_print_object_end)
             assert((*it_print_object_end)->m_shared_regions == nullptr || (*it_print_object_end)->m_shared_regions == print_object_regions);
         if (print_object_regions == nullptr) {
@@ -2212,7 +2234,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                                 update_apply_status((*it)->invalidate_state_by_config_options(old_config, new_config, diff_keys));
                     },
                     print_variant_index,
-                    wall_ramp_enabled)) {
+                    wall_ramp_enabled,
+                    shell_ramp_enabled)) {
                 // Per-part gradient: PrintRegionConfig alone cannot reveal a change in which slots
                 // have per-part enabled, so compare against the snapshot taken when these regions
                 // were generated and regenerate on any difference (slot toggled, per-part moved
@@ -2248,6 +2271,7 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 print_variant_index,
                 print_object.is_fuzzy_skin_painted(),
                 wall_ramp_enabled,
+                shell_ramp_enabled,
                 slot_per_part_enabled);
         }
         for (auto it = it_print_object; it != it_print_object_end; ++it)

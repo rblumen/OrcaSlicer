@@ -9,6 +9,7 @@
 #include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/Preset.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/PrintConfigConstants.hpp"
 #include "libslic3r/LocalesUtils.hpp"
@@ -22,6 +23,7 @@
 
 #include <boost/nowide/fstream.hpp>
 #include "libslic3r/Config.hpp"
+#include <algorithm>
 #include <cstddef>
 #include <initializer_list>
 #include <memory>
@@ -259,7 +261,7 @@ SCENARIO("Config ini load/save interface", "[Config]") {
 TEST_CASE("The wall count transition defaults to a hard step with a taper ratio of 10", "[Config]")
 {
     const PrintRegionConfig &defaults = PrintRegionConfig::defaults();
-    CHECK(defaults.wall_loops_transition.value == WallLoopsTransition::Hard);
+    CHECK(defaults.wall_loops_transition.value == CountTransition::Hard);
     CHECK_THAT(defaults.wall_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
     CHECK(DynamicPrintConfig::full_print_config().opt_serialize("wall_loops_transition") == "hard");
 }
@@ -288,7 +290,7 @@ TEST_CASE("The wall count transition survives an INI and a JSON round trip", "[C
         CHECK(reason.empty());
     }
     REQUIRE(loaded.has("wall_loops_transition"));
-    CHECK(loaded.opt_enum<WallLoopsTransition>("wall_loops_transition") == WallLoopsTransition::Ramp);
+    CHECK(loaded.opt_enum<CountTransition>("wall_loops_transition") == CountTransition::Ramp);
     CHECK_THAT(loaded.opt_float("wall_ramp_taper_ratio"), Catch::Matchers::WithinAbs(7.5, 1e-9));
 }
 
@@ -305,8 +307,83 @@ TEST_CASE("A config saved without the wall count transition loads as a hard step
     PrintRegionConfig region;
     region.apply(loaded, true);
     CHECK(region.wall_loops.value == 3);
-    CHECK(region.wall_loops_transition.value == WallLoopsTransition::Hard);
+    CHECK(region.wall_loops_transition.value == CountTransition::Hard);
     CHECK_THAT(region.wall_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
+}
+
+TEST_CASE("The shell count transitions default to a hard step with a taper ratio of 10", "[Config][ShellRamp]")
+{
+    const PrintRegionConfig &defaults = PrintRegionConfig::defaults();
+    CHECK(defaults.top_shell_layers_transition.value == CountTransition::Hard);
+    CHECK(defaults.bottom_shell_layers_transition.value == CountTransition::Hard);
+    CHECK_THAT(defaults.top_shell_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
+    CHECK_THAT(defaults.bottom_shell_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
+    const DynamicPrintConfig full = DynamicPrintConfig::full_print_config();
+    CHECK(full.opt_serialize("top_shell_layers_transition") == "hard");
+    CHECK(full.opt_serialize("bottom_shell_layers_transition") == "hard");
+}
+
+TEST_CASE("The shell count transitions are print preset options", "[Config][ShellRamp]")
+{
+    const std::vector<std::string> &options = Preset::print_options();
+    const std::string key = GENERATE("top_shell_layers_transition", "top_shell_ramp_taper_ratio",
+                                     "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio");
+    CAPTURE(key);
+    CHECK(std::find(options.begin(), options.end(), key) != options.end());
+}
+
+TEST_CASE("The shell count transitions survive an INI and a JSON round trip with their hard and ramp keys", "[Config][ShellRamp]")
+{
+    DynamicPrintConfig config;
+    config.set_deserialize_strict({
+        { "top_shell_layers_transition", "ramp" },
+        { "top_shell_ramp_taper_ratio", 7.5 },
+        { "bottom_shell_layers_transition", "hard" },
+        { "bottom_shell_ramp_taper_ratio", 2.5 },
+    });
+    const bool json = GENERATE(false, true);
+    CAPTURE(json);
+    DynamicPrintConfig loaded;
+    if (! json) {
+        ScopedTemporaryFile tmp(".ini");
+        config.save(tmp.string());
+        loaded.load_from_ini(tmp.string(), ForwardCompatibilitySubstitutionRule::Disable);
+    } else {
+        ScopedTemporaryFile tmp(".json");
+        config.save_to_json(tmp.string(), "test_preset", "User", "1.0.0.0");
+        ConfigSubstitutionContext substitutions(ForwardCompatibilitySubstitutionRule::Disable);
+        std::map<std::string, std::string> key_values;
+        std::string reason;
+        REQUIRE(loaded.load_from_json(tmp.string(), substitutions, true, key_values, reason) == 0);
+        CHECK(reason.empty());
+    }
+    REQUIRE(loaded.has("top_shell_layers_transition"));
+    REQUIRE(loaded.has("bottom_shell_layers_transition"));
+    CHECK(loaded.opt_serialize("top_shell_layers_transition") == "ramp");
+    CHECK(loaded.opt_serialize("bottom_shell_layers_transition") == "hard");
+    CHECK(loaded.opt_enum<CountTransition>("top_shell_layers_transition") == CountTransition::Ramp);
+    CHECK(loaded.opt_enum<CountTransition>("bottom_shell_layers_transition") == CountTransition::Hard);
+    CHECK_THAT(loaded.opt_float("top_shell_ramp_taper_ratio"), Catch::Matchers::WithinAbs(7.5, 1e-9));
+    CHECK_THAT(loaded.opt_float("bottom_shell_ramp_taper_ratio"), Catch::Matchers::WithinAbs(2.5, 1e-9));
+}
+
+TEST_CASE("A config saved without the shell count transitions loads as a hard step", "[Config][ShellRamp]")
+{
+    ScopedTemporaryFile tmp(".ini");
+    {
+        boost::nowide::ofstream ofs(tmp.string());
+        ofs << "top_shell_layers = 5\n";
+    }
+    DynamicPrintConfig loaded = DynamicPrintConfig::full_print_config();
+    const ConfigSubstitutions substitutions = loaded.load_from_ini(tmp.string(), ForwardCompatibilitySubstitutionRule::Disable);
+    CHECK(substitutions.empty());
+    PrintRegionConfig region;
+    region.apply(loaded, true);
+    CHECK(region.top_shell_layers.value == 5);
+    CHECK(region.top_shell_layers_transition.value == CountTransition::Hard);
+    CHECK(region.bottom_shell_layers_transition.value == CountTransition::Hard);
+    CHECK_THAT(region.top_shell_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
+    CHECK_THAT(region.bottom_shell_ramp_taper_ratio.value, Catch::Matchers::WithinAbs(10., 1e-9));
 }
 
 TEST_CASE("Flush-volume warning predicate respects used filament transitions", "[Config][Regression]")

@@ -376,11 +376,11 @@ static t_config_enum_values s_keys_map_WallDirection{
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WallDirection)
 
 //Orca
-static t_config_enum_values s_keys_map_WallLoopsTransition{
-    { "hard", int(WallLoopsTransition::Hard) },
-    { "ramp", int(WallLoopsTransition::Ramp) },
+static t_config_enum_values s_keys_map_CountTransition{
+    { "hard", int(CountTransition::Hard) },
+    { "ramp", int(CountTransition::Ramp) },
 };
-CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(WallLoopsTransition)
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(CountTransition)
 
 //Orca
 static t_config_enum_values s_keys_map_SurfaceFillOrder{
@@ -1548,6 +1548,35 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("mm");	// millimeters, CIS languages need translation
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.));
+
+    def = this->add("bottom_shell_layers_transition", coEnum);
+    def->label = L("Bottom shell count transition");
+    def->category = L("Strength");
+    def->tooltip = L("How the bottom shell depth changes at the boundary of a modifier that sets a different bottom shell "
+                     "than the part. The depth counts both Bottom shell layers and Bottom shell thickness.\n\n"
+                     "Hard: the depth changes in one step at the modifier's outline.\n"
+                     "Ramp: the depth changes gradually from the part's to the modifier's over a ramp set by the taper ratio. "
+                     "Ramp can't be used with spiral vase mode.\n\n"
+                     "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
+                     "and nested modifiers do not inherit it.");
+    def->enum_keys_map = &ConfigOptionEnum<CountTransition>::get_enum_values();
+    def->enum_values.push_back("hard");
+    def->enum_values.push_back("ramp");
+    // TRN: A shell count transition: the shell depth changes in one step at the modifier's outline.
+    def->enum_labels.push_back(L("Hard"));
+    // TRN: A shell count transition: the shell depth changes gradually, over a taper.
+    def->enum_labels.push_back(L("Ramp"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<CountTransition>(CountTransition::Hard));
+
+    def = this->add("bottom_shell_ramp_taper_ratio", coFloat);
+    def->label = L("Bottom shell ramp taper ratio");
+    def->category = L("Strength");
+    def->tooltip = L("With the Ramp bottom shell count transition, the length of the ramp per unit of change in bottom shell "
+                     "thickness. For example, 10 changes the bottom shell thickness by 1 mm over 10 mm. 0 keeps the hard step.");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(10.));
 
     def = this->add("bottom_color_penetration_layers", coInt);
     def->label = L("Bottom paint penetration layers");
@@ -5990,7 +6019,7 @@ void PrintConfigDef::init_fff_params()
                      "Ramp needs the Arachne wall generator and can't be used with spiral vase mode.\n\n"
                      "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
                      "and nested modifiers do not inherit it.");
-    def->enum_keys_map = &ConfigOptionEnum<WallLoopsTransition>::get_enum_values();
+    def->enum_keys_map = &ConfigOptionEnum<CountTransition>::get_enum_values();
     def->enum_values.push_back("hard");
     def->enum_values.push_back("ramp");
     // TRN: A wall count transition: the wall count changes in one step at the modifier's outline.
@@ -5998,7 +6027,7 @@ void PrintConfigDef::init_fff_params()
     // TRN: A wall count transition: the wall count changes gradually, over a taper.
     def->enum_labels.push_back(L("Ramp"));
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionEnum<WallLoopsTransition>(WallLoopsTransition::Hard));
+    def->set_default_value(new ConfigOptionEnum<CountTransition>(CountTransition::Hard));
 
     def = this->add("wall_ramp_taper_ratio", coFloat);
     def->label = L("Wall ramp taper ratio");
@@ -8211,6 +8240,35 @@ void PrintConfigDef::init_fff_params()
     def->sidetext = L("mm");	// millimeters, CIS languages need translation
     def->min = 0;
     def->set_default_value(new ConfigOptionFloat(0.6));
+
+    def = this->add("top_shell_layers_transition", coEnum);
+    def->label = L("Top shell count transition");
+    def->category = L("Strength");
+    def->tooltip = L("How the top shell depth changes at the boundary of a modifier that sets a different top shell "
+                     "than the part. The depth counts both Top shell layers and Top shell thickness.\n\n"
+                     "Hard: the depth changes in one step at the modifier's outline.\n"
+                     "Ramp: the depth changes gradually from the part's to the modifier's over a ramp set by the taper ratio. "
+                     "Ramp can't be used with spiral vase mode.\n\n"
+                     "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
+                     "and nested modifiers do not inherit it.");
+    def->enum_keys_map = &ConfigOptionEnum<CountTransition>::get_enum_values();
+    def->enum_values.push_back("hard");
+    def->enum_values.push_back("ramp");
+    // TRN: A shell count transition: the shell depth changes in one step at the modifier's outline.
+    def->enum_labels.push_back(L("Hard"));
+    // TRN: A shell count transition: the shell depth changes gradually, over a taper.
+    def->enum_labels.push_back(L("Ramp"));
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnum<CountTransition>(CountTransition::Hard));
+
+    def = this->add("top_shell_ramp_taper_ratio", coFloat);
+    def->label = L("Top shell ramp taper ratio");
+    def->category = L("Strength");
+    def->tooltip = L("With the Ramp top shell count transition, the length of the ramp per unit of change in top shell "
+                     "thickness. For example, 10 changes the top shell thickness by 1 mm over 10 mm. 0 keeps the hard step.");
+    def->min = 0;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(10.));
 
     def = this->add("top_color_penetration_layers", coInt);
     def->label = L("Top paint penetration layers");

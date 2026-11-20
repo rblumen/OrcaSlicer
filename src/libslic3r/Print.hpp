@@ -139,18 +139,39 @@ enum class SlicingPipelineStepPlugin {
 
 // A PrintRegion object represents a group of volumes to print
 // sharing the same config (including the same assigned extruder(s))
-// Orca: Keys the region of a modifier with a ramped transition to the walls it shares with its part, so that modifier
-// regions with the same config over parents with different wall counts are kept apart.
-struct WallRampKey
+// Orca: Keys the region of a modifier with a ramped transition to the counts of the region it modifies, so that modifier
+// regions with the same config over parents with different counts are kept apart. The wall part also groups the
+// modifier with the walls it shares with its part. Each part is set only for a transition the modifier sets to Ramp.
+struct RampKey
 {
     // Wall count of the region the modifier modifies, which its wall count changes from over the ramp. -1 if none.
-    int base { -1 };
+    int    wall_base { -1 };
     // Wall count of the walls it shares: those of the part, through any modifiers with a ramped transition in between.
-    int root { -1 };
+    int    wall_root { -1 };
+    // Top shell layers and thickness of the region the modifier modifies, which its top shell changes from over the ramp.
+    // top_base_layers is -1 if the top shell is not on the Ramp.
+    int    top_base_layers { -1 };
+    double top_base_thickness { 0. };
+    // The same for the bottom shell.
+    int    bottom_base_layers { -1 };
+    double bottom_base_thickness { 0. };
 
-    bool operator==(const WallRampKey &rhs) const { return base == rhs.base && root == rhs.root; }
-    bool operator!=(const WallRampKey &rhs) const { return ! (*this == rhs); }
-    bool operator<(const WallRampKey &rhs) const { return base < rhs.base || (base == rhs.base && root < rhs.root); }
+    bool operator==(const RampKey &rhs) const { return this->tie() == rhs.tie(); }
+    bool operator!=(const RampKey &rhs) const { return ! (*this == rhs); }
+    bool operator<(const RampKey &rhs) const { return this->tie() < rhs.tie(); }
+
+private:
+    std::tuple<int, int, int, double, int, double> tie() const
+        { return std::tie(wall_base, wall_root, top_base_layers, top_base_thickness, bottom_base_layers, bottom_base_thickness); }
+};
+
+// Orca: The shell counts a region's shells are built with where no Shell Ramp zone decides, see PrintRegion::shell_default_counts().
+struct ShellCounts
+{
+    int    top_layers { 0 };
+    double top_thickness { 0. };
+    int    bottom_layers { 0 };
+    double bottom_thickness { 0. };
 };
 
 // Orca: whether the Ramp wall count transition is active for an object. Only Arachne walls follow the ramp, and spiral
@@ -160,14 +181,21 @@ inline bool wall_ramp_active(const PrintConfig &print_config, const PrintObjectC
     return object_config.wall_generator.value == PerimeterGeneratorType::Arachne && ! print_config.spiral_mode.value;
 }
 
+// Orca: whether the Ramp shell count transitions are active. Spiral vase mode prints no top shells and a fixed bottom,
+// so a modifier set to Ramp is keyed to the shell counts of its parent only when this holds. Both wall generators work.
+inline bool shell_ramp_active(const PrintConfig &print_config)
+{
+    return ! print_config.spiral_mode.value;
+}
+
 class PrintRegion
 {
 public:
     PrintRegion() = default;
     PrintRegion(const PrintRegionConfig &config);
-    PrintRegion(const PrintRegionConfig &config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), WallRampKey wall_ramp_key = {}) : m_config(config), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_wall_ramp_key(wall_ramp_key) {}
+    PrintRegion(const PrintRegionConfig &config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), RampKey ramp_key = {}) : m_config(config), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_ramp_key(ramp_key) {}
     PrintRegion(PrintRegionConfig &&config);
-    PrintRegion(PrintRegionConfig &&config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), WallRampKey wall_ramp_key = {}) : m_config(std::move(config)), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_wall_ramp_key(wall_ramp_key) {}
+    PrintRegion(PrintRegionConfig &&config, const size_t config_hash, int print_object_region_id = -1, ObjectID gradient_volume_id = ObjectID(), RampKey ramp_key = {}) : m_config(std::move(config)), m_config_hash(config_hash), m_print_object_region_id(print_object_region_id), m_gradient_volume_id(gradient_volume_id), m_ramp_key(ramp_key) {}
     ~PrintRegion() = default;
 
 // Methods NOT modifying the PrintRegion's state:
@@ -182,15 +210,35 @@ public:
     // existing behavior for all paths not using per_part_gradient.
     ObjectID                    gradient_volume_id() const throw() { return m_gradient_volume_id; }
     // Orca: Set for the region of a modifier with a ramped transition, default for any other region.
-    const WallRampKey&          wall_ramp_key() const throw() { return m_wall_ramp_key; }
+    const RampKey&              ramp_key() const throw() { return m_ramp_key; }
     // Orca: The wall count this modifier region changes from over the ramp, -1 if it is not one with a ramped transition.
-    int                         wall_ramp_base_loops() const throw() { return m_wall_ramp_key.base; }
+    int                         wall_ramp_base_loops() const throw() { return m_ramp_key.wall_base; }
     // Orca: Whether this region shares the walls of its part over a ramp instead of walling its own outline. A taper
     // ratio of 0 keeps the hard step.
-    bool                        has_wall_ramp() const throw() { return m_wall_ramp_key.base >= 0 && m_config.wall_ramp_taper_ratio.value > 0.; }
+    bool                        has_wall_ramp() const throw() { return m_ramp_key.wall_base >= 0 && m_config.wall_ramp_taper_ratio.value > 0.; }
     // Orca: The wall count of the walls this region shares. Regions share walls only when these agree, which for
     // regions without a ramp is the plain equality of their wall counts.
-    int                         wall_group_loops() const throw() { return this->has_wall_ramp() ? m_wall_ramp_key.root : m_config.wall_loops.value; }
+    int                         wall_group_loops() const throw() { return this->has_wall_ramp() ? m_ramp_key.wall_root : m_config.wall_loops.value; }
+    // Orca: Whether the top (bottom) shell of this modifier region ramps from the shell of the region it modifies. A
+    // taper ratio of 0 keeps the hard step.
+    bool                        has_top_shell_ramp() const throw() { return m_ramp_key.top_base_layers >= 0 && m_config.top_shell_ramp_taper_ratio.value > 0.; }
+    bool                        has_bottom_shell_ramp() const throw() { return m_ramp_key.bottom_base_layers >= 0 && m_config.bottom_shell_ramp_taper_ratio.value > 0.; }
+    // Orca: The shell counts this region's shells are built with where no Shell Ramp zone decides: for a shell on the
+    // Ramp, those of the region the modifier modifies, so that its depth only changes where the ramp says so; otherwise
+    // the region's own.
+    ShellCounts                 shell_default_counts() const throw() {
+        ShellCounts counts { m_config.top_shell_layers.value, m_config.top_shell_thickness.value,
+                             m_config.bottom_shell_layers.value, m_config.bottom_shell_thickness.value };
+        if (this->has_top_shell_ramp()) {
+            counts.top_layers    = m_ramp_key.top_base_layers;
+            counts.top_thickness = m_ramp_key.top_base_thickness;
+        }
+        if (this->has_bottom_shell_ramp()) {
+            counts.bottom_layers    = m_ramp_key.bottom_base_layers;
+            counts.bottom_thickness = m_ramp_key.bottom_base_thickness;
+        }
+        return counts;
+    }
 	// 1-based extruder identifier for this region and role.
 	unsigned int 				extruder(FlowRole role) const;
     Flow                        flow(const PrintObject &object, FlowRole role, double layer_height, bool first_layer = false) const;
@@ -209,7 +257,7 @@ public:
     void                        set_config(PrintRegionConfig &&config) { m_config = std::move(config); m_config_hash = m_config.hash(); }
     void                        config_apply_only(const ConfigBase &other, const t_config_option_keys &keys, bool ignore_nonexistent = false)
                                         { m_config.apply_only(other, keys, ignore_nonexistent); m_config_hash = m_config.hash(); }
-    void                        set_wall_ramp_key(const WallRampKey &wall_ramp_key) { m_wall_ramp_key = wall_ramp_key; }
+    void                        set_ramp_key(const RampKey &ramp_key) { m_ramp_key = ramp_key; }
 private:
     friend Print;
     friend void print_region_ref_inc(PrintRegion&);
@@ -225,7 +273,7 @@ private:
     // letting same-color volumes within a combined ModelObject be tracked separately for gradient
     // emission. Default invalid -> region keying behaves exactly as before.
     ObjectID           m_gradient_volume_id;
-    WallRampKey        m_wall_ramp_key;
+    RampKey            m_ramp_key;
 };
 
 inline bool operator==(const PrintRegion &lhs, const PrintRegion &rhs) { return lhs.config_hash() == rhs.config_hash() && lhs.config() == rhs.config(); }
