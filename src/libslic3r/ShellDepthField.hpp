@@ -75,10 +75,12 @@ struct ShellRule
     double layers { 0. };
     // T in mm, 0 where n is.
     double thickness { 0. };
-    // The shell of the thinner end of a ramp, which holds across all of it whatever n and T are: a layer in it is in
-    // the shell too.
-    double floor_layers { 0. };
-    double floor_thickness { 0. };
+    // The shells of a ramp's two ends, (n, T) of the zone and of the shell it modifies: a layer in both is in the shell
+    // too, whatever n and T are across the ramp. All 0 for no such floor.
+    double floor_in_layers { 0. };
+    double floor_in_thickness { 0. };
+    double floor_base_layers { 0. };
+    double floor_base_thickness { 0. };
 
     // Whether the layer k layers from the surface, dz from it in Z, is in the shell.
     bool solid(size_t k, double dz) const;

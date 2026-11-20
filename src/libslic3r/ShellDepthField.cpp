@@ -39,7 +39,8 @@ double shell_depth(int layers, double thickness, double layer_height)
 // As the stock projection, see PrintObject::discover_vertical_shells() and discover_horizontal_shells().
 bool ShellRule::solid(size_t k, double dz) const
 {
-    return double(k) < layers || dz < thickness - EPSILON || double(k) < floor_layers || dz < floor_thickness - EPSILON;
+    auto in_shell = [k, dz](double n, double T) { return double(k) < n || dz < T - EPSILON; };
+    return in_shell(layers, thickness) || (in_shell(floor_in_layers, floor_in_thickness) && in_shell(floor_base_layers, floor_base_thickness));
 }
 
 bool ShellRampProfile::active() const { return taper_ratio > 0. && std::abs(this->depth() - this->base_depth()) > EPSILON; }
@@ -53,10 +54,11 @@ ShellRule ShellRampProfile::at(double distance) const
         return base;
     const ShellRule in { double(std::max(layers, 0)), layers > 0 ? thickness : 0. };
     const double    t = std::clamp(distance / this->ramp_length(), 0., 1.);
-    // Interpolating n and T separately can put fewer layers in the shell than both ends do when they move in opposite
-    // directions, so the thinner end's shell is held across the whole ramp.
-    const ShellRule &thinner = this->thickens() ? base : in;
-    return { in.layers + (base.layers - in.layers) * t, in.thickness + (base.thickness - in.thickness) * t, thinner.layers, thinner.thickness };
+    // Interpolating n and T separately can put fewer layers in the shell than both ends do. A layer that both ends' rules
+    // put in the shell is in it across the whole ramp. Holding the shell of the end with the lesser depth instead would
+    // be right only at the nominal layer height: at another one the ends can swap order and the thicker end would be held.
+    return { in.layers + (base.layers - in.layers) * t, in.thickness + (base.thickness - in.thickness) * t,
+             in.layers, in.thickness, base.layers, base.thickness };
 }
 
 namespace {
@@ -325,7 +327,8 @@ float shell_margin(const ShellRule &rule, size_t k, double dz, double layer_heig
     auto margin = [k, dz, layer_height](double layers, double thickness) {
         return std::max(layers - double(k) - 1e-3, layer_height > 0. ? (thickness - dz - EPSILON) / layer_height : -std::numeric_limits<double>::infinity());
     };
-    return float(std::max(margin(rule.layers, rule.thickness), margin(rule.floor_layers, rule.floor_thickness)));
+    return float(std::max(margin(rule.layers, rule.thickness),
+                          std::min(margin(rule.floor_in_layers, rule.floor_in_thickness), margin(rule.floor_base_layers, rule.floor_base_thickness))));
 }
 
 ShellLevels threshold(const ShellDepthField &field, const marchsq::ShellRaster &raster, ShellSide side, const std::vector<double> &offsets)

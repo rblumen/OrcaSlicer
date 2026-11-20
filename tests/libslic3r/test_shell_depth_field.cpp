@@ -410,3 +410,34 @@ TEST_CASE("The shell levels of a ramp with a minimum thickness at the base count
         CHECK(area_mm2(diff(top.level[k], top.reach)) < 1e-3);
     }
 }
+
+// The ends' depths are compared at the nominal layer height, but the layers can be of another height (variable layer
+// height, height ranges), where the ends can swap order. The floor is the layers both ends' rules put in the shell.
+TEST_CASE("A ramp holds the layers of both its ends at any layer height", "[ShellDepthField]")
+{
+    // The leading layers the rule puts in the shell, with layers 0.4 mm apart.
+    const auto layers_at = [](const ShellRule &rule) {
+        size_t k = 0;
+        while (k < 20 && rule.solid(k, 0.4 * double(k)))
+            ++ k;
+        return k;
+    };
+
+    // Thickening at 0.2 mm: D0 = 1 mm, D1 = 1.4 mm, ramp 4 mm. At 0.4 mm the zone's own rule has 4 layers, the base's 5.
+    const ShellRampProfile thickening { 5, 0., 2, 1.4, 10., H };
+    REQUIRE(thickening.thickens());
+    CHECK(layers_at(thickening.at(0.)) == 4);
+    CHECK(layers_at(thickening.at(2.)) == 4);
+    CHECK(layers_at(thickening.at(4.)) == 5);
+    CHECK(layers_at(thickening.at(6.)) == 5);
+
+    // Thinning at 0.2 mm: D0 = 1.4 mm, D1 = 1 mm, ramp 4 mm. At 0.4 mm the base has 4 layers, the zone's own rule 5, and
+    // the shell never steps down below the base's.
+    const ShellRampProfile thinning { 2, 1.4, 5, 0., 10., H };
+    REQUIRE_FALSE(thinning.thickens());
+    CHECK(layers_at(thinning.at(0.)) == 5);
+    CHECK(layers_at(thinning.at(1.)) == 5);
+    CHECK(layers_at(thinning.at(2.)) == 4);
+    CHECK(layers_at(thinning.at(4.)) == 4);
+    CHECK(layers_at(thinning.at(5.)) == 4);
+}
