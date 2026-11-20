@@ -16,6 +16,7 @@
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <algorithm>
@@ -538,20 +539,30 @@ TEST_CASE("A modifier on the Ramp shell transition over different shells in two 
                                    // Every layer range must carry a layer_height (see layer_height_profile_from_ranges).
                                    range.set_deserialize_strict({ { "top_shell_layers", 4 }, { "layer_height", 0.2 } });
                                    object.layer_config_ranges[{ 1., 2. }].assign_config(std::move(range));
+                                   object.name                  = "Strap";
+                                   object.volumes.front()->name = "Base";
+                                   object.volumes.back()->name  = "Reinforcement";
                                });
     REQUIRE(top_shell_bases(print) == std::vector<int>{ 3, 4 });
     const std::string warnings = prepare_infill_warnings(print);
     CAPTURE(warnings);
     CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("same shell settings in every height range"));
 
-    std::vector<const ModelVolume*> inconsistent;
+    // The warning names the modifier, and the part of the object it modifies.
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("Reinforcement"));
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("Base"));
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("Strap"));
+
+    std::vector<ModifierOnPart> inconsistent;
     CHECK(build_shell_depth_field(*print.objects().front(), &inconsistent) == nullptr);
     REQUIRE(inconsistent.size() == 1);
-    CHECK(inconsistent.front() == print.model().objects.front()->volumes.back());
+    CHECK(inconsistent.front().first == print.model().objects.front()->volumes.back());
+    CHECK(inconsistent.front().second == print.model().objects.front()->volumes.front());
 }
 
 // The part is 20 x 20 x 2 mm, 10 layers of 0.2 mm, its top shell 3 layers with a 0.4 mm minimum (0.6 mm); the modifier
-// over x = 15..25 sets 5 layers (1 mm) with a taper ratio of 10, so the ramp runs 4 mm across the top face from x = 15.
+// over x = 15..25 sets 5 layers (1 mm) with a taper ratio of 10, so the ramp runs 4 mm across the top face from x = 15,
+// over which the shell steps from 5 layers down to 3.
 TEST_CASE("The shell depth field of a print follows a modifier on the Ramp top shell transition", "[Shells][ShellRamp]")
 {
     Print print;
@@ -567,19 +578,68 @@ TEST_CASE("The shell depth field of a print follows a modifier on the Ramp top s
     const Layer      &top     = *object.layers().back();
     const BoundingBox extents = get_extents(top.lslices);
     const double      x0 = unscaled(extents.min.x()), y0 = unscaled(extents.min.y());
-    auto depth = [&](double x) { return field->depth(ShellSide::Top, Vec3d(x0 + x, y0 + 10., top.slice_z)); };
-    REQUIRE(depth(17.5).has_value());
-    CHECK_THAT(*depth(17.5), Catch::Matchers::WithinAbs(1., 0.02));
-    REQUIRE(depth(13.).has_value());
-    CHECK_THAT(*depth(13.), Catch::Matchers::WithinAbs(0.8, 0.02));
-    CHECK_FALSE(depth(5.).has_value());
-    CHECK_FALSE(field->depth(ShellSide::Bottom, Vec3d(x0 + 17.5, y0 + 10., object.layers().front()->slice_z)).has_value());
+    const std::vector<double> offsets { 0., 0.2, 0.4, 0.6, 0.8, 1., 1.2 };
+    auto layers = [&](double x) { return field->solid_layers(ShellSide::Top, Vec3d(x0 + x, y0 + 10., top.slice_z), offsets); };
+    CHECK(layers(17.5) == std::optional<size_t>(5));
+    // 1 and 3 mm into the ramp: n = 4.5 and 3.5.
+    CHECK(layers(14.) == std::optional<size_t>(5));
+    CHECK(layers(12.) == std::optional<size_t>(4));
+    CHECK_FALSE(layers(5.).has_value());
+    CHECK_FALSE(field->solid_layers(ShellSide::Bottom, Vec3d(x0 + 17.5, y0 + 10., object.layers().front()->slice_z), offsets).has_value());
 
-    // Under the top layer the shell reaches 4 layers down inside the zone: 0, 0.2, ... 0.8 mm are below 1 mm.
+    // Under the top layer the shell reaches 5 layers down inside the zone.
     const std::vector<LayerShellLevels> levels = make_shell_levels(*field, object);
     REQUIRE(levels.size() == 10);
     CHECK(levels.back().top.level.size() == 5);
     CHECK(levels.back().bottom.empty());
+}
+
+// Layers of 0.28 mm over a first layer of 0.2 mm, so the bottom layers lie 0, 0.2, 0.48, 0.76, 1.04 and 1.32 mm above the
+// bed, and the part's bottom shell is 3 layers without a minimum thickness. A modifier over x = 15..25 on the Ramp sets
+// 1 layer or 5, and its ramp is 3 * 0.28 - 0.28 = 0.56 mm * 10 = 5.6 mm long either way. On the bed layer, the shell is
+// the modifier's inside the zone and steps towards the part's 3 layers across the ramp. Counted as stock counts them,
+// by layer: a depth in mm compared with the real layer heights would put one more layer in, 2 or 6 inside the zone,
+// and 4 at the end of the thinning ramp.
+TEST_CASE("The bottom shell levels of a print with a thinner first layer count layers as stock does", "[Shells][ShellRamp]")
+{
+    const int layers = GENERATE(1, 5);
+    CAPTURE(layers);
+
+    DynamicPrintConfig config = shell_config();
+    config.set_deserialize_strict({ { "layer_height", 0.28 }, { "initial_layer_print_height", 0.2 }, { "bottom_shell_thickness", 0. } });
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, config, one_part,
+                               { modifier_box(15., 25., shell_modifier_config({ { "bottom_shell_layers", layers }, { "bottom_shell_layers_transition", "ramp" } })) });
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.layers().size() >= 6);
+    REQUIRE_THAT(object.layers()[0]->height, Catch::Matchers::WithinAbs(0.2, 1e-6));
+    REQUIRE_THAT(object.layers()[1]->height, Catch::Matchers::WithinAbs(0.28, 1e-6));
+    const auto field = build_shell_depth_field(object);
+    REQUIRE(field != nullptr);
+
+    const std::vector<LayerShellLevels> levels = make_shell_levels(*field, object);
+    const ShellLevels                  &bottom = levels.front().bottom;
+    REQUIRE_FALSE(bottom.empty());
+    // As many levels as the thicker of the two shells.
+    CHECK(bottom.level.size() == size_t(std::max(layers, 3)));
+
+    // The levels at a point of the bed layer, in the frame the layers were sliced in.
+    const BoundingBox extents = get_extents(object.layers().front()->lslices);
+    const double      x0 = unscaled(extents.min.x()), y0 = unscaled(extents.min.y());
+    auto levels_at = [&bottom, y0](double x) {
+        const Point p = Point::new_scale(x, y0 + 10.);
+        size_t      k = 0;
+        while (k < bottom.level.size() && contains(bottom.level[k], p))
+            ++ k;
+        return k;
+    };
+    CHECK(levels_at(x0 + 17.5) == size_t(layers));
+    // Just inside where the ramp ends, about 5 mm from the zone, n = 2.8 or 3.2: thinning, the part's 3 layers; thickening,
+    // the last step of 4.
+    const BoundingBox reach = get_extents(bottom.reach);
+    REQUIRE_THAT(unscaled(reach.min.x()) - x0, Catch::Matchers::WithinAbs(15. - 5.6, 0.55));
+    CHECK(levels_at(unscaled(reach.min.x()) + 0.6) == size_t(layers < 3 ? 3 : 4));
 }
 
 // Two modifiers with the same config, which sets the top shell minimum, over parts with a top shell minimum of 0.4 and

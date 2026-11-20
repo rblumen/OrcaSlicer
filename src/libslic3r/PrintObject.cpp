@@ -752,18 +752,18 @@ void PrintObject::prepare_infill()
                                    volume_region.model_volume->name, this->model_object()->name));
         }
 
-    // Orca: the depth of the shells of modifiers with a ramped shell transition, see ShellDepthField.hpp. A modifier whose
-    // shell settings differ between height ranges gets no zone.
+    // Orca: the shells of modifiers with a ramped shell transition, see ShellDepthField.hpp. A modifier gets no zone on a
+    // part where its shell settings, or the part's, differ between height ranges.
     std::shared_ptr<const ShellDepthField> shell_depth_field;
     if (shell_ramp_active(m_print->config())) {
-        std::vector<const ModelVolume*> inconsistent_modifiers;
-        shell_depth_field = build_shell_depth_field(*this, &inconsistent_modifiers);
-        for (const ModelVolume *modifier : inconsistent_modifiers)
+        std::vector<ModifierOnPart> inconsistent;
+        shell_depth_field = build_shell_depth_field(*this, &inconsistent);
+        for (const auto &[modifier, part] : inconsistent)
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
-                // TRN: %1% is the name of a modifier, %2% the name of an object.
-                Slic3r::format(_u8L("Modifier %1% of object %2% uses the Hard shell count transitions: the Ramp transitions need "
-                                    "the same shell settings in every height range."),
-                               modifier->name, this->model_object()->name));
+                // TRN: %1% is the name of a modifier, %2% the name of a part it modifies, %3% the name of their object.
+                Slic3r::format(_u8L("Modifier %1% uses the Hard shell count transitions on part %2% of object %3%: the Ramp transitions "
+                                    "need the same shell settings in every height range."),
+                               modifier->name, part->name, this->model_object()->name));
     }
     m_print->throw_if_canceled();
 

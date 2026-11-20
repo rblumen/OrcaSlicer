@@ -36,54 +36,62 @@ double shell_depth(int layers, double thickness, double layer_height)
     return layers > 0 ? std::max(layers * layer_height, thickness) : 0.;
 }
 
-bool ShellRampProfile::active() const { return taper_ratio > 0. && std::abs(depth - base_depth) > EPSILON; }
+// As the stock projection, see PrintObject::discover_vertical_shells() and discover_horizontal_shells().
+bool ShellRule::solid(size_t k, double dz) const { return double(k) < layers || dz < thickness - EPSILON; }
 
-double ShellRampProfile::ramp_length() const { return std::abs(depth - base_depth) * taper_ratio; }
+bool ShellRampProfile::active() const { return taper_ratio > 0. && std::abs(this->depth() - this->base_depth()) > EPSILON; }
 
-double ShellRampProfile::at(double distance) const
+double ShellRampProfile::ramp_length() const { return std::abs(this->depth() - this->base_depth()) * taper_ratio; }
+
+ShellRule ShellRampProfile::at(double distance) const
 {
+    const ShellRule base { double(std::max(base_layers, 0)), base_layers > 0 ? base_thickness : 0. };
     if (! this->active())
-        return base_depth;
-    return depth - (depth - base_depth) * std::clamp(distance / this->ramp_length(), 0., 1.);
+        return base;
+    const ShellRule in { double(std::max(layers, 0)), layers > 0 ? thickness : 0. };
+    const double    t = std::clamp(distance / this->ramp_length(), 0., 1.);
+    return { in.layers + (base.layers - in.layers) * t, in.thickness + (base.thickness - in.thickness) * t };
 }
 
 namespace {
 
-// The combination over the zones on one side, see the top of ShellDepthField.hpp, fed one zone at a time.
-struct SideCombination
+// The combination over the zones on one side at one point, see the top of ShellDepthField.hpp, fed one zone at a time
+// with a value that grows with how far the zone's shell reaches: the largest value over the deciding zones that
+// thicken, else the smallest over those that thin, else none. `nearest` is the value of the zone whose ramp ends
+// nearest to deciding, and `reach` the largest L_s - d, which crosses 0 where the last ramp ends.
+template<class Value> struct SideCombination
 {
-    double thicker { - std::numeric_limits<double>::infinity() };
-    double thinner { std::numeric_limits<double>::infinity() };
-    double reach { - std::numeric_limits<double>::infinity() };
-    double nearest_base { 0. };
+    std::optional<Value> thicker;
+    std::optional<Value> thinner;
+    std::optional<Value> nearest;
+    double               reach { - std::numeric_limits<double>::infinity() };
 
-    void add(const ShellRampProfile &profile, double distance)
+    void add(const ShellRampProfile &profile, double distance, Value value)
     {
-        if (! profile.active())
-            return;
         const double length = profile.ramp_length();
         if (length - distance > reach) {
-            reach        = length - distance;
-            nearest_base = profile.base_depth;
+            reach   = length - distance;
+            nearest = value;
         }
         if (! (distance < length))
             return;
-        const double depth = profile.at(distance);
-        if (depth > profile.base_depth)
-            thicker = std::max(thicker, depth);
-        else if (depth < profile.base_depth)
-            thinner = std::min(thinner, depth);
+        if (profile.thickens())
+            thicker = thicker ? std::max(*thicker, value) : value;
+        else
+            thinner = thinner ? std::min(*thinner, value) : value;
     }
 
-    std::optional<double> decided() const
-    {
-        if (thicker > - std::numeric_limits<double>::infinity())
-            return thicker;
-        if (thinner < std::numeric_limits<double>::infinity())
-            return thinner;
-        return std::nullopt;
-    }
+    std::optional<Value> decided() const { return thicker ? thicker : thinner; }
 };
+
+// How many of the leading layers the rule puts in the shell.
+size_t solid_prefix(const ShellRule &rule, const std::vector<double> &offsets)
+{
+    size_t k = 0;
+    while (k < offsets.size() && rule.solid(k, offsets[k]))
+        ++ k;
+    return k;
+}
 
 struct ZoneField
 {
@@ -91,7 +99,8 @@ struct ZoneField
     ShellRampProfile    bottom;
     SurfaceZoneDistance distance;
 
-    bool active() const { return distance.active(); }
+    bool                    active() const { return distance.active(); }
+    const ShellRampProfile &profile(ShellSide side) const { return side == ShellSide::Top ? top : bottom; }
 };
 
 } // namespace
@@ -125,7 +134,7 @@ std::shared_ptr<const ShellDepthField> ShellDepthField::build(const std::vector<
             distance_params.coarse_edge       = params.coarse_edge;
             distance_params.edge_growth       = std::clamp(params.edge_growth, 0., 1.);
             distance_params.surface_tolerance = params.surface_tolerance;
-            // Inside the zone the depth is D1 wherever it is.
+            // Inside the zone the rule is (n1, T1) wherever it is.
             distance_params.inside_limit      = 0.;
             distance_params.outside_limit     = std::max(in.top.active() ? in.top.ramp_length() : 0., in.bottom.active() ? in.bottom.ramp_length() : 0.) +
                 std::max(0., params.outside_margin);
@@ -137,38 +146,22 @@ std::shared_ptr<const ShellDepthField> ShellDepthField::build(const std::vector<
     return std::shared_ptr<const ShellDepthField>(new ShellDepthField(std::move(impl)));
 }
 
-size_t ShellDepthField::zone_count() const { return m_impl->zones.size(); }
-bool   ShellDepthField::zone_active(size_t zone) const { return m_impl->zones[zone].active(); }
-double ShellDepthField::signed_distance(size_t zone, const Vec3d &p) const { return m_impl->zones[zone].distance.signed_distance(p); }
+size_t                  ShellDepthField::zone_count() const { return m_impl->zones.size(); }
+bool                    ShellDepthField::zone_active(size_t zone) const { return m_impl->zones[zone].active(); }
+const ShellRampProfile &ShellDepthField::profile(size_t zone, ShellSide side) const { return m_impl->zones[zone].profile(side); }
+double                  ShellDepthField::signed_distance(size_t zone, const Vec3d &p) const { return m_impl->zones[zone].distance.signed_distance(p); }
 
-std::optional<double> ShellDepthField::depth(ShellSide side, const Vec3d &p) const
+std::optional<size_t> ShellDepthField::solid_layers(ShellSide side, const Vec3d &p, const std::vector<double> &offsets) const
 {
-    SideCombination combination;
+    SideCombination<size_t> combination;
     for (const ZoneField &zone : m_impl->zones) {
-        const ShellRampProfile &profile = side == ShellSide::Top ? zone.top : zone.bottom;
-        if (zone.active() && profile.active())
-            combination.add(profile, zone.distance.signed_distance(p));
+        const ShellRampProfile &profile = zone.profile(side);
+        if (zone.active() && profile.active()) {
+            const double distance = zone.distance.signed_distance(p);
+            combination.add(profile, distance, solid_prefix(profile.at(distance), offsets));
+        }
     }
     return combination.decided();
-}
-
-ShellSample ShellDepthField::sample(const Vec3d &p) const
-{
-    SideCombination top, bottom;
-    for (const ZoneField &zone : m_impl->zones) {
-        if (! zone.active())
-            continue;
-        const double distance = zone.distance.signed_distance(p);
-        top.add(zone.top, distance);
-        bottom.add(zone.bottom, distance);
-    }
-    auto reach = [](const SideCombination &side) { return std::isfinite(side.reach) ? float(side.reach) : -1.f; };
-    ShellSample out;
-    out.top_reach    = reach(top);
-    out.top_depth    = float(top.decided().value_or(top.nearest_base));
-    out.bottom_reach = reach(bottom);
-    out.bottom_depth = float(bottom.decided().value_or(bottom.nearest_base));
-    return out;
 }
 
 bool ShellDepthField::may_affect(const BoundingBoxf3 &box) const
@@ -190,13 +183,16 @@ BoundingBoxf3 ShellDepthField::reach() const
     return out;
 }
 
-double ShellDepthField::max_depth(ShellSide side) const
+ShellRule ShellDepthField::deepest(ShellSide side) const
 {
-    double out = 0.;
+    ShellRule out;
     for (const ZoneField &zone : m_impl->zones) {
-        const ShellRampProfile &profile = side == ShellSide::Top ? zone.top : zone.bottom;
+        const ShellRampProfile &profile = zone.profile(side);
         if (zone.active() && profile.active())
-            out = std::max({ out, profile.base_depth, profile.depth });
+            for (const ShellRule &rule : { profile.at(0.), profile.at(profile.ramp_length()) }) {
+                out.layers    = std::max(out.layers, rule.layers);
+                out.thickness = std::max(out.thickness, rule.thickness);
+            }
     }
     return out;
 }
@@ -221,61 +217,67 @@ namespace marchsq {
 
 namespace {
 
-// The field sampled once over a layer, on a grid of gsizef, and read by marching squares on a raster of rsizef: a
-// raster value is interpolated between the grid samples around it. One of the four values of ShellSample is read.
+// The zone distances sampled once over a layer, on a grid of gsizef, and values computed from them read by marching
+// squares on a raster of rsizef: a raster value is interpolated between the grid values around it.
 struct ShellRaster
 {
     static constexpr float gsizef = 0.5f;
     static constexpr float rsizef = 0.05f;
-    const coord_t  rsize  = Slic3r::scaled(rsizef);
+    const coord_t          rsize  = Slic3r::scaled(rsizef);
     const long             gsize  = std::lround(gsizef / rsizef);
 
-    Slic3r::Point                    size;
-    Slic3r::Point                    offs;
-    // Grid samples, row by row.
-    size_t                           grid_rows { 0 };
-    size_t                           grid_cols { 0 };
-    std::vector<Slic3r::ShellSample> samples;
+    Slic3r::Point      size;
+    Slic3r::Point      offs;
+    size_t             grid_rows { 0 };
+    size_t             grid_cols { 0 };
+    size_t             zones { 0 };
+    // The signed distance of every zone at every grid sample, sample by sample and the samples row by row.
+    std::vector<float> distances;
 
     ShellRaster(const Slic3r::ShellDepthField &field, const Slic3r::BoundingBox &bbox, double z) : size(bbox.size()), offs(bbox.min)
     {
         // Every grid sample a raster value can be interpolated from, and one more on each axis.
         grid_rows = size_t(rows() / gsize + 2);
         grid_cols = size_t(cols() / gsize + 2);
-        samples.resize(grid_rows * grid_cols);
+        zones     = field.zone_count();
+        distances.assign(grid_rows * grid_cols * zones, std::numeric_limits<float>::infinity());
         for (size_t r = 0; r < grid_rows; ++ r)
             for (size_t c = 0; c < grid_cols; ++ c) {
                 const Slic3r::Point pt = to_Point(Coord(long(r) * gsize, long(c) * gsize));
-                samples[r * grid_cols + c] = field.sample(Slic3r::Vec3d(Slic3r::unscaled(pt.x()), Slic3r::unscaled(pt.y()), z));
+                const Slic3r::Vec3d p(Slic3r::unscaled(pt.x()), Slic3r::unscaled(pt.y()), z);
+                for (size_t zone = 0; zone < zones; ++ zone)
+                    if (field.zone_active(zone))
+                        distances[(r * grid_cols + c) * zones + zone] = float(field.signed_distance(zone, p));
             }
     }
 
-    long rows() const { return to_coordr(size.y()); }
-    long cols() const { return to_coordr(size.x()); }
+    size_t samples() const { return grid_rows * grid_cols; }
+    long   rows() const { return to_coordr(size.y()); }
+    long   cols() const { return to_coordr(size.x()); }
 
-    // Bilinear between the grid samples around raster point (row, col).
-    float get(float Slic3r::ShellSample::*value, long row, long col) const
+    // Bilinear between the grid values around raster point (row, col).
+    float get(const std::vector<float> &grid, long row, long col) const
     {
-        const long   r0 = std::min<long>(row / gsize, long(grid_rows) - 2);
-        const long   c0 = std::min<long>(col / gsize, long(grid_cols) - 2);
-        const float  tr = std::clamp(float(row - r0 * gsize) / float(gsize), 0.f, 1.f);
-        const float  tc = std::clamp(float(col - c0 * gsize) / float(gsize), 0.f, 1.f);
-        auto at = [this, value](long r, long c) { return samples[size_t(r) * grid_cols + size_t(c)].*value; };
+        const long  r0 = std::min<long>(row / gsize, long(grid_rows) - 2);
+        const long  c0 = std::min<long>(col / gsize, long(grid_cols) - 2);
+        const float tr = std::clamp(float(row - r0 * gsize) / float(gsize), 0.f, 1.f);
+        const float tc = std::clamp(float(col - c0 * gsize) / float(gsize), 0.f, 1.f);
+        auto at = [this, &grid](long r, long c) { return grid[size_t(r) * grid_cols + size_t(c)]; };
         const float top    = at(r0, c0) + tc * (at(r0, c0 + 1) - at(r0, c0));
         const float bottom = at(r0 + 1, c0) + tc * (at(r0 + 1, c0 + 1) - at(r0 + 1, c0));
         return top + tr * (bottom - top);
     }
 
-    inline coord_t to_coord(long x) const { return x * rsize; }
-    inline long            to_coordr(coord_t x) const { return long(x / rsize); }
-    inline Slic3r::Point   to_Point(const Coord &p) const { return Slic3r::Point(to_coord(p.c) + offs.x(), to_coord(p.r) + offs.y()); }
+    inline coord_t       to_coord(long x) const { return x * rsize; }
+    inline long          to_coordr(coord_t x) const { return long(x / rsize); }
+    inline Slic3r::Point to_Point(const Coord &p) const { return Slic3r::Point(to_coord(p.c) + offs.x(), to_coord(p.r) + offs.y()); }
 };
 
-// One of the values of a ShellRaster.
+// Values on the grid of a ShellRaster, one per grid sample.
 struct ShellRasterValue
 {
-    const ShellRaster *raster;
-    float Slic3r::ShellSample::*value;
+    const ShellRaster        *raster;
+    const std::vector<float> *grid;
 };
 
 } // namespace
@@ -283,7 +285,7 @@ struct ShellRasterValue
 template<> struct _RasterTraits<ShellRasterValue>
 {
     using ValueType = float;
-    static float  get(const ShellRasterValue &sv, size_t row, size_t col) { return sv.raster->get(sv.value, long(row), long(col)); }
+    static float  get(const ShellRasterValue &sv, size_t row, size_t col) { return sv.raster->get(*sv.grid, long(row), long(col)); }
     static size_t rows(const ShellRasterValue &sv) { return size_t(sv.raster->rows()); }
     static size_t cols(const ShellRasterValue &sv) { return size_t(sv.raster->cols()); }
 };
@@ -294,12 +296,12 @@ namespace Slic3r {
 
 namespace {
 
-// Where the value exceeds iso.
-Polygons contour(const marchsq::ShellRaster &raster, float ShellSample::*value, float iso)
+// Where the grid values exceed 0.
+Polygons contour(const marchsq::ShellRaster &raster, const std::vector<float> &grid)
 {
-    const marchsq::ShellRasterValue view { &raster, value };
+    const marchsq::ShellRasterValue view { &raster, &grid };
     Polygons out;
-    for (const marchsq::Ring &ring : marchsq::execute(view, iso, { raster.gsize, raster.gsize })) {
+    for (const marchsq::Ring &ring : marchsq::execute(view, 0.f, { raster.gsize, raster.gsize })) {
         Polygon &polygon = out.emplace_back();
         polygon.points.reserve(ring.size());
         for (const marchsq::Coord &crd : ring)
@@ -309,21 +311,49 @@ Polygons contour(const marchsq::ShellRaster &raster, float ShellSample::*value, 
     return union_(out, pftEvenOdd);
 }
 
-ShellLevels threshold(const marchsq::ShellRaster &raster, float ShellSample::*reach, float ShellSample::*depth, double max_depth,
-                      const std::vector<double> &offsets)
+// By how much, in layers, the rule puts the layer k layers from the surface, dz from it, in the shell: positive where
+// it does. A layer count exactly k, as inside a zone of k layers, is short of it by a thousandth of a layer, so that
+// the rounding of the raster does not put the layer in.
+float shell_margin(const ShellRule &rule, size_t k, double dz, double layer_height)
 {
+    return float(std::max(rule.layers - double(k) - 1e-3, (rule.thickness - dz - EPSILON) / layer_height));
+}
+
+ShellLevels threshold(const ShellDepthField &field, const marchsq::ShellRaster &raster, ShellSide side, const std::vector<double> &offsets)
+{
+    std::vector<const ShellRampProfile*> profiles(raster.zones, nullptr);
+    for (size_t zone = 0; zone < raster.zones; ++ zone)
+        if (field.zone_active(zone) && field.profile(zone, side).active())
+            profiles[zone] = &field.profile(zone, side);
     ShellLevels out;
-    out.reach = contour(raster, reach, 0.f);
+    if (std::none_of(profiles.begin(), profiles.end(), [](const ShellRampProfile *profile) { return profile != nullptr; }))
+        return out;
+
+    // Every grid sample through the combination, giving each zone the value `value(profile, distance)`.
+    std::vector<float> grid(raster.samples());
+    auto combine = [&raster, &profiles, &grid](auto &&value, auto &&result) {
+        for (size_t sample = 0; sample < raster.samples(); ++ sample) {
+            SideCombination<float> combination;
+            for (size_t zone = 0; zone < raster.zones; ++ zone)
+                if (profiles[zone] != nullptr) {
+                    const double distance = raster.distances[sample * raster.zones + zone];
+                    combination.add(*profiles[zone], distance, value(*profiles[zone], distance));
+                }
+            grid[sample] = result(combination);
+        }
+    };
+
+    combine([](const ShellRampProfile &, double) { return 0.f; },
+            [](const SideCombination<float> &combination) { return std::isfinite(combination.reach) ? float(combination.reach) : -1.f; });
+    out.reach = contour(raster, grid);
     if (out.reach.empty())
         return out;
-    // The depth runs on past the end of the reach, so that clipping the levels to it leaves no gap between the levels
-    // and the stock shell outside.
-    for (const double offset : offsets) {
-        // As the stock projection: the layer is in the shell if its distance is below the depth by more than EPSILON.
-        const double iso = offset + EPSILON;
-        if (iso >= max_depth)
-            break;
-        Polygons level = intersection(contour(raster, depth, float(iso)), out.reach);
+    for (size_t k = 0; k < offsets.size(); ++ k) {
+        // Past where the last ramp ends, the nearest zone's (n0, T0) runs on, so that clipping the level to the reach
+        // leaves no gap between it and the stock shell outside.
+        combine([k, dz = offsets[k]](const ShellRampProfile &profile, double distance) { return shell_margin(profile.at(distance), k, dz, profile.layer_height); },
+                [](const SideCombination<float> &combination) { return combination.decided().value_or(combination.nearest.value_or(-1.f)); });
+        Polygons level = intersection(contour(raster, grid), out.reach);
         if (level.empty())
             break;
         out.level.emplace_back(std::move(level));
@@ -351,16 +381,16 @@ LayerShellLevels make_layer_shell_levels(const ShellDepthField &field, const Bou
     bbox.merge(align_to_grid(bbox.min, Point(cell, cell)));
     const marchsq::ShellRaster raster(field, bbox, z);
 
-    out.top    = threshold(raster, &ShellSample::top_reach, &ShellSample::top_depth, field.max_depth(ShellSide::Top), top_offsets);
-    out.bottom = threshold(raster, &ShellSample::bottom_reach, &ShellSample::bottom_depth, field.max_depth(ShellSide::Bottom), bottom_offsets);
+    out.top    = threshold(field, raster, ShellSide::Top, top_offsets);
+    out.bottom = threshold(field, raster, ShellSide::Bottom, bottom_offsets);
     return out;
 }
 
 std::vector<LayerShellLevels> make_shell_levels(const ShellDepthField &field, const PrintObject &object)
 {
-    const auto                   layers     = object.layers();
-    const double                 top_max    = field.max_depth(ShellSide::Top);
-    const double                 bottom_max = field.max_depth(ShellSide::Bottom);
+    const auto                    layers  = object.layers();
+    const ShellRule               top     = field.deepest(ShellSide::Top);
+    const ShellRule               bottom  = field.deepest(ShellSide::Bottom);
     std::vector<LayerShellLevels> out(layers.size());
     tbb::parallel_for(tbb::blocked_range<size_t>(0, layers.size()), [&](const tbb::blocked_range<size_t> &range) {
         for (size_t i = range.begin(); i < range.end(); ++ i) {
@@ -371,17 +401,19 @@ std::vector<LayerShellLevels> make_shell_levels(const ShellDepthField &field, co
             if (! field.may_affect(BoundingBoxf3(Vec3d(unscaled(extents.min.x()), unscaled(extents.min.y()), layer.bottom_z()),
                                                  Vec3d(unscaled(extents.max.x()), unscaled(extents.max.y()), layer.print_z))))
                 continue;
-            // The Z distances the stock projection compares with the shell thickness, up to the deepest shell.
+            // The Z distances the stock projection compares with the shell thickness, as far as any zone's shell reaches.
             std::vector<double> top_offsets, bottom_offsets;
             for (size_t k = 0; k <= i; ++ k) {
-                top_offsets.emplace_back(layer.print_z - layers[i - k]->print_z);
-                if (top_offsets.back() >= top_max)
+                const double dz = layer.print_z - layers[i - k]->print_z;
+                if (! top.solid(k, dz))
                     break;
+                top_offsets.emplace_back(dz);
             }
             for (size_t k = 0; i + k < layers.size(); ++ k) {
-                bottom_offsets.emplace_back(layers[i + k]->bottom_z() - layer.bottom_z());
-                if (bottom_offsets.back() >= bottom_max)
+                const double dz = layers[i + k]->bottom_z() - layer.bottom_z();
+                if (! bottom.solid(k, dz))
                     break;
+                bottom_offsets.emplace_back(dz);
             }
             out[i] = make_layer_shell_levels(field, extents, layer.slice_z, top_offsets, bottom_offsets);
         }
@@ -389,7 +421,7 @@ std::vector<LayerShellLevels> make_shell_levels(const ShellDepthField &field, co
     return out;
 }
 
-std::shared_ptr<const ShellDepthField> build_shell_depth_field(const PrintObject &object, std::vector<const ModelVolume*> *inconsistent_modifiers)
+std::shared_ptr<const ShellDepthField> build_shell_depth_field(const PrintObject &object, std::vector<ModifierOnPart> *inconsistent)
 {
     const PrintObjectRegions *regions = object.shared_regions();
     if (regions == nullptr)
@@ -401,7 +433,8 @@ std::shared_ptr<const ShellDepthField> build_shell_depth_field(const PrintObject
     // spans the object's whole height, so the modifier gets one only if its profiles are the same in every height
     // range it appears in.
     auto same_profile = [](const ShellRampProfile &a, const ShellRampProfile &b) {
-        return a.base_depth == b.base_depth && a.depth == b.depth && a.taper_ratio == b.taper_ratio;
+        return a.base_layers == b.base_layers && a.base_thickness == b.base_thickness && a.layers == b.layers && a.thickness == b.thickness &&
+            a.taper_ratio == b.taper_ratio;
     };
     struct Candidate
     {
@@ -409,11 +442,10 @@ std::shared_ptr<const ShellDepthField> build_shell_depth_field(const PrintObject
         size_t        ranges { 0 };
         bool          consistent { true };
     };
-    using Volumes = std::pair<const ModelVolume*, const ModelVolume*>;
-    std::map<Volumes, Candidate> candidates;
-    const PrintRegion           *first_part_region = nullptr;
+    std::map<ModifierOnPart, Candidate> candidates;
+    const PrintRegion                  *first_part_region = nullptr;
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : regions->layer_ranges) {
-        std::map<Volumes, ShellRampZone> in_range;
+        std::map<ModifierOnPart, ShellRampZone> in_range;
         for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
             if (volume_region.parent < 0 || volume_region.region == nullptr || volume_region.region == layer_range.volume_regions[volume_region.parent].region)
                 continue;
@@ -429,12 +461,11 @@ std::shared_ptr<const ShellDepthField> build_shell_depth_field(const PrintObject
             const PrintRegionConfig &config = modifier.config();
             ShellRampZone            zone;
             if (key.top_base_layers >= 0)
-                zone.top = { shell_depth(key.top_base_layers, key.top_base_thickness, layer_height),
-                             shell_depth(config.top_shell_layers.value, config.top_shell_thickness.value, layer_height), config.top_shell_ramp_taper_ratio.value };
+                zone.top = { key.top_base_layers, key.top_base_thickness, config.top_shell_layers.value, config.top_shell_thickness.value,
+                             config.top_shell_ramp_taper_ratio.value, layer_height };
             if (key.bottom_base_layers >= 0)
-                zone.bottom = { shell_depth(key.bottom_base_layers, key.bottom_base_thickness, layer_height),
-                                shell_depth(config.bottom_shell_layers.value, config.bottom_shell_thickness.value, layer_height),
-                                config.bottom_shell_ramp_taper_ratio.value };
+                zone.bottom = { key.bottom_base_layers, key.bottom_base_thickness, config.bottom_shell_layers.value, config.bottom_shell_thickness.value,
+                                config.bottom_shell_ramp_taper_ratio.value, layer_height };
             in_range[{ volume_region.model_volume, layer_range.volume_regions[root].model_volume }] = std::move(zone);
         }
         for (auto &[volumes, zone] : in_range) {
@@ -458,8 +489,8 @@ std::shared_ptr<const ShellDepthField> build_shell_depth_field(const PrintObject
     std::vector<ShellRampZone>        zones;
     for (auto &[volumes, candidate] : candidates) {
         if (! candidate.consistent) {
-            if (inconsistent_modifiers != nullptr && std::find(inconsistent_modifiers->begin(), inconsistent_modifiers->end(), volumes.first) == inconsistent_modifiers->end())
-                inconsistent_modifiers->emplace_back(volumes.first);
+            if (inconsistent != nullptr)
+                inconsistent->emplace_back(volumes);
             continue;
         }
         if (! candidate.zone.top.active() && ! candidate.zone.bottom.active())
