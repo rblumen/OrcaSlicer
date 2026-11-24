@@ -4,19 +4,27 @@
 #include <catch2/matchers/catch_matchers.hpp>
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include "libslic3r/BoundingBox.hpp"
 #include "libslic3r/Config.hpp"
+#include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Layer.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintBase.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/ShellDepthField.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/TriangleSelector.hpp"
+#include "libslic3r/Point.hpp"
+#include "libslic3r/Polygon.hpp"
 
 #include <boost/algorithm/string/predicate.hpp>
 #include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
+#include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -201,11 +209,11 @@ TEST_CASE("A modifier on the Ramp shell transitions is keyed to the shell counts
     // The walls are not on the Ramp.
     CHECK(key.wall_base == -1);
     CHECK_FALSE(modifier->has_wall_ramp());
-    CHECK(modifier->has_top_shell_ramp());
-    CHECK(modifier->has_bottom_shell_ramp());
+    CHECK(modifier->has_top_shell_ramp(0.2));
+    CHECK(modifier->has_bottom_shell_ramp(0.2));
     CHECK(modifier->config().bottom_shell_layers.value == 5);
 
-    const ShellCounts counts = modifier->shell_default_counts();
+    const ShellCounts counts = modifier->shell_default_counts(0.2);
     CHECK(counts.top_layers == 3);
     CHECK_THAT(counts.top_thickness, Catch::Matchers::WithinAbs(0.4, 1e-9));
     CHECK(counts.bottom_layers == 3);
@@ -231,16 +239,16 @@ TEST_CASE("Each shell transition keys only its own shell", "[Shells][ShellRamp]"
 
     const PrintRegion *modifier = region_with_top_shell_layers(print, 5);
     REQUIRE(modifier != nullptr);
-    CHECK(modifier->has_top_shell_ramp() == top_ramp);
-    CHECK(modifier->has_bottom_shell_ramp() == bottom_ramp);
-    const ShellCounts counts = modifier->shell_default_counts();
+    CHECK(modifier->has_top_shell_ramp(0.2) == top_ramp);
+    CHECK(modifier->has_bottom_shell_ramp(0.2) == bottom_ramp);
+    const ShellCounts counts = modifier->shell_default_counts(0.2);
     CHECK(counts.top_layers == (top_ramp ? 3 : 5));
     CHECK(counts.bottom_layers == (bottom_ramp ? 3 : 5));
     // The part is never keyed and builds its own shell.
     const PrintRegion *part = region_with_top_shell_layers(print, 3);
     REQUIRE(part != nullptr);
     CHECK(part->ramp_key() == RampKey{});
-    CHECK(part->shell_default_counts().top_layers == 3);
+    CHECK(part->shell_default_counts(0.2).top_layers == 3);
 }
 
 // The same modifier config over parts with 3 and 4 top layers would otherwise make one region, losing the count the
@@ -466,6 +474,247 @@ TEST_CASE("Without a modifier changing a shell on the Ramp transition the G-code
     const std::vector<std::string> keyed = gcode_commands(gcode(keyed_print));
     REQUIRE(plain.size() > 1000);
     const std::string difference = first_difference(plain, keyed);
+    CAPTURE(difference);
+    CHECK(difference.empty());
+}
+
+// Both transitions on Ramp: the wall part of the key is what a modifier on the Ramp wall transition alone gets, and
+// the shell parts are set beside it.
+TEST_CASE("A modifier on the Ramp wall and shell transitions is keyed for both", "[Shells][ShellRamp]")
+{
+    DynamicPrintConfig config = shell_config("arachne");
+    config.set_deserialize_strict({ { "wall_ramp_taper_ratio", 10. } });
+    auto modifier_key = [&config](const DynamicPrintConfig &modifier_config) {
+        Print print;
+        Model model;
+        apply_parts_with_modifiers(print, model, config, one_part, { modifier_box(15., 25., modifier_config) });
+        const PrintRegion *modifier = region_with_top_shell_layers(print, 5);
+        REQUIRE(modifier != nullptr);
+        return modifier->ramp_key();
+    };
+    const RampKey walls = modifier_key(shell_modifier_config({ { "wall_loops", 4 }, { "wall_loops_transition", "ramp" } }));
+    const RampKey both  = modifier_key(shell_modifier_config({ { "wall_loops", 4 }, { "wall_loops_transition", "ramp" },
+                                                               { "top_shell_layers_transition", "ramp" }, { "bottom_shell_layers_transition", "ramp" } }));
+    REQUIRE(walls.wall_base == 2);
+    CHECK(walls.top_base_layers == -1);
+    CHECK(both.wall_base == walls.wall_base);
+    CHECK(both.wall_root == walls.wall_root);
+    CHECK(both.top_base_layers == 3);
+    CHECK_THAT(both.top_base_thickness, Catch::Matchers::WithinAbs(0.4, 1e-9));
+    CHECK(both.bottom_base_layers == 3);
+    CHECK_THAT(both.bottom_base_thickness, Catch::Matchers::WithinAbs(0.2, 1e-9));
+}
+
+// The part's top shell is 3 layers with a 0.4 mm minimum and its bottom shell 3 layers with a 0.2 mm minimum. A modifier
+// on the Ramp with a taper ratio of 0 that sets those same shells changes nothing and does not warn.
+TEST_CASE("A modifier on the Ramp shell transition with a taper ratio of 0 keeping the shell does not warn", "[Shells][ShellRamp]")
+{
+    struct Variant { const char *transition_key; const char *taper_key; const char *count_key; const char *thickness_key; double thickness; };
+    const Variant variant = GENERATE(
+        Variant{ "top_shell_layers_transition",    "top_shell_ramp_taper_ratio",    "top_shell_layers",    "top_shell_thickness",    0.4 },
+        Variant{ "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio", "bottom_shell_layers", "bottom_shell_thickness", 0.2 });
+    CAPTURE(variant.transition_key);
+
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, shell_config(), one_part,
+                               { modifier_box(15., 25., part_config({ { variant.transition_key, "ramp" }, { variant.taper_key, 0. },
+                                                                      { variant.count_key, 3 }, { variant.thickness_key, variant.thickness } })) });
+    const std::string warnings = prepare_infill_warnings(print);
+    CAPTURE(warnings);
+    CHECK(warnings.empty());
+}
+
+// The part's shells are 0.6 mm deep at 0.2 mm layers, 3 layers with a minimum of 0.4 mm on top and 0.2 mm at the bottom.
+// A modifier setting 2 layers with a 0.6 mm minimum is as deep at the nominal layer height, yet is 3 layers under
+// thinner ones: it has no ramp, builds its own shell and says it keeps the hard step, whatever its taper ratio.
+TEST_CASE("A modifier on the Ramp shell transition as deep as the shell it modifies but set differently falls back to Hard and warns", "[Shells][ShellRamp]")
+{
+    struct Variant { const char *transition_key; const char *taper_key; const char *count_key; const char *thickness_key; const char *direction; };
+    const Variant variant = GENERATE(
+        Variant{ "top_shell_layers_transition",    "top_shell_ramp_taper_ratio",    "top_shell_layers",    "top_shell_thickness",    "top" },
+        Variant{ "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio", "bottom_shell_layers", "bottom_shell_thickness", "bottom" });
+    const double taper_ratio = GENERATE(0., 5.);
+    CAPTURE(variant.transition_key, taper_ratio);
+
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, shell_config(), one_part,
+                               { modifier_box(15., 25., part_config({ { variant.transition_key, "ramp" }, { variant.taper_key, taper_ratio },
+                                                                      { variant.count_key, 2 }, { variant.thickness_key, 0.6 } })) });
+    const PrintObject &object   = *print.objects().front();
+    const PrintRegion *modifier = nullptr;
+    for (size_t i = 0; i < object.num_printing_regions(); ++ i)
+        if (const RampKey &key = object.printing_region(i).ramp_key(); key.top_base_layers >= 0 || key.bottom_base_layers >= 0)
+            modifier = &object.printing_region(i);
+    REQUIRE(modifier != nullptr);
+    CHECK_FALSE(modifier->has_top_shell_ramp(0.2));
+    CHECK_FALSE(modifier->has_bottom_shell_ramp(0.2));
+    // The region keeps its own counts, not those of the part.
+    const ShellCounts counts = modifier->shell_default_counts(0.2);
+    CHECK(counts.top_layers == (std::string(variant.direction) == "top" ? 2 : 3));
+    CHECK(counts.bottom_layers == (std::string(variant.direction) == "top" ? 3 : 2));
+
+    const std::string warnings = prepare_infill_warnings(print);
+    CAPTURE(warnings);
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring(std::string("Hard ") + variant.direction + " shell count transition"));
+}
+
+// The part keyed by its top shell count in two height ranges, 3 layers below z = 1 and 4 above, gives the modifier no
+// single base depth: it gets no zone, and a warning.
+TEST_CASE("A modifier on the Ramp shell transition over different shells in two height ranges warns and gets no zone", "[Shells][ShellRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, shell_config(), one_part,
+                               { modifier_box(15., 25., shell_modifier_config({ { "top_shell_layers_transition", "ramp" } })) },
+                               [](ModelObject &object) {
+                                   DynamicPrintConfig range;
+                                   // Every layer range must carry a layer_height (see layer_height_profile_from_ranges).
+                                   range.set_deserialize_strict({ { "top_shell_layers", 4 }, { "layer_height", 0.2 } });
+                                   object.layer_config_ranges[{ 1., 2. }].assign_config(std::move(range));
+                                   object.name                  = "Strap";
+                                   object.volumes.front()->name = "Base";
+                                   object.volumes.back()->name  = "Reinforcement";
+                               });
+    REQUIRE(top_shell_bases(print) == std::vector<int>{ 3, 4 });
+    const std::string warnings = prepare_infill_warnings(print);
+    CAPTURE(warnings);
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("same shell settings in every height range"));
+
+    // The warning names the modifier, and the part of the object it modifies.
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("Reinforcement"));
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("Base"));
+    CHECK_THAT(warnings, Catch::Matchers::ContainsSubstring("Strap"));
+
+    std::vector<ModifierOnPart> inconsistent;
+    CHECK(build_shell_depth_field(*print.objects().front(), &inconsistent) == nullptr);
+    REQUIRE(inconsistent.size() == 1);
+    CHECK(inconsistent.front().first == print.model().objects.front()->volumes.back());
+    CHECK(inconsistent.front().second == print.model().objects.front()->volumes.front());
+}
+
+// The part is 20 x 20 x 2 mm, 10 layers of 0.2 mm, its top shell 3 layers with a 0.4 mm minimum (0.6 mm); the modifier
+// over x = 15..25 sets 5 layers (1 mm) with a taper ratio of 10, so the ramp runs 4 mm across the top face from x = 15,
+// over which the shell steps from 5 layers down to 3.
+TEST_CASE("The shell depth field of a print follows a modifier on the Ramp top shell transition", "[Shells][ShellRamp]")
+{
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, shell_config(), one_part,
+                               { modifier_box(15., 25., shell_modifier_config({ { "top_shell_layers_transition", "ramp" } })) });
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.layers().size() == 10);
+    const auto field = build_shell_depth_field(object);
+    REQUIRE(field != nullptr);
+
+    // The part's corner in the frame the layers were sliced in.
+    const Layer      &top     = *object.layers().back();
+    const BoundingBox extents = get_extents(top.lslices);
+    const double      x0 = unscaled(extents.min.x()), y0 = unscaled(extents.min.y());
+    const std::vector<double> offsets { 0., 0.2, 0.4, 0.6, 0.8, 1., 1.2 };
+    auto layers = [&](double x) { return field->solid_layers(ShellSide::Top, Vec3d(x0 + x, y0 + 10., top.slice_z), offsets); };
+    CHECK(layers(17.5) == std::optional<size_t>(5));
+    // 1 and 3 mm into the ramp: n = 4.5 and 3.5.
+    CHECK(layers(14.) == std::optional<size_t>(5));
+    CHECK(layers(12.) == std::optional<size_t>(4));
+    CHECK_FALSE(layers(5.).has_value());
+    CHECK_FALSE(field->solid_layers(ShellSide::Bottom, Vec3d(x0 + 17.5, y0 + 10., object.layers().front()->slice_z), offsets).has_value());
+
+    // Under the top layer the shell reaches 5 layers down inside the zone.
+    const std::vector<LayerShellLevels> levels = make_shell_levels(*field, object);
+    REQUIRE(levels.size() == 10);
+    CHECK(levels.back().top.level.size() == 5);
+    CHECK(levels.back().bottom.empty());
+}
+
+// Layers of 0.28 mm over a first layer of 0.2 mm, so the bottom layers lie 0, 0.2, 0.48, 0.76, 1.04 and 1.32 mm above the
+// bed, and the part's bottom shell is 3 layers without a minimum thickness. A modifier over x = 15..25 on the Ramp sets
+// 1 layer or 5, and its ramp is 3 * 0.28 - 0.28 = 0.56 mm * 10 = 5.6 mm long either way. On the bed layer, the shell is
+// the modifier's inside the zone and steps towards the part's 3 layers across the ramp. Counted as stock counts them,
+// by layer: a depth in mm compared with the real layer heights would put one more layer in, 2 or 6 inside the zone,
+// and 4 at the end of the thinning ramp.
+TEST_CASE("The bottom shell levels of a print with a thinner first layer count layers as stock does", "[Shells][ShellRamp]")
+{
+    const int layers = GENERATE(1, 5);
+    CAPTURE(layers);
+
+    DynamicPrintConfig config = shell_config();
+    config.set_deserialize_strict({ { "layer_height", 0.28 }, { "initial_layer_print_height", 0.2 }, { "bottom_shell_thickness", 0. } });
+    Print print;
+    Model model;
+    slice_parts_with_modifiers(print, model, config, one_part,
+                               { modifier_box(15., 25., shell_modifier_config({ { "bottom_shell_layers", layers }, { "bottom_shell_layers_transition", "ramp" } })) });
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.layers().size() >= 6);
+    REQUIRE_THAT(object.layers()[0]->height, Catch::Matchers::WithinAbs(0.2, 1e-6));
+    REQUIRE_THAT(object.layers()[1]->height, Catch::Matchers::WithinAbs(0.28, 1e-6));
+    const auto field = build_shell_depth_field(object);
+    REQUIRE(field != nullptr);
+
+    const std::vector<LayerShellLevels> levels = make_shell_levels(*field, object);
+    const ShellLevels                  &bottom = levels.front().bottom;
+    REQUIRE_FALSE(bottom.empty());
+    // As many levels as the thicker of the two shells.
+    CHECK(bottom.level.size() == size_t(std::max(layers, 3)));
+
+    // The levels at a point of the bed layer, in the frame the layers were sliced in.
+    const BoundingBox extents = get_extents(object.layers().front()->lslices);
+    const double      x0 = unscaled(extents.min.x()), y0 = unscaled(extents.min.y());
+    auto levels_at = [&bottom, y0](double x) {
+        const Point p = Point::new_scale(x, y0 + 10.);
+        size_t      k = 0;
+        while (k < bottom.level.size() && contains(bottom.level[k], p))
+            ++ k;
+        return k;
+    };
+    CHECK(levels_at(x0 + 17.5) == size_t(layers));
+    // Just inside where the ramp ends, about 5 mm from the zone, n = 2.8 or 3.2: thinning, the part's 3 layers; thickening,
+    // the last step of 4.
+    const BoundingBox reach = get_extents(bottom.reach);
+    REQUIRE_THAT(unscaled(reach.min.x()) - x0, Catch::Matchers::WithinAbs(15. - 5.6, 0.55));
+    CHECK(levels_at(unscaled(reach.min.x()) + 0.6) == size_t(layers < 3 ? 3 : 4));
+}
+
+// Two modifiers with the same config, which sets the top shell minimum, over parts with a top shell minimum of 0.4 and
+// 0.8 mm: on the Ramp they are keyed apart into two regions, on Hard they share one. Nothing reads the key's shell counts
+// yet, so the G-code is the same.
+TEST_CASE("Shell Ramp modifiers split over parts with different shell thickness print as on Hard", "[Shells][ShellRamp]")
+{
+    const char *wall_generator = GENERATE("classic", "arachne");
+    CAPTURE(wall_generator);
+
+    const std::vector<DynamicPrintConfig> parts { part_config({ { "top_shell_thickness", 0.4 } }), part_config({ { "top_shell_thickness", 0.8 } }) };
+    auto modifiers = [](const char *transition) {
+        const DynamicPrintConfig config = shell_modifier_config({ { "top_shell_thickness", 0.4 }, { "top_shell_layers_transition", transition },
+                                                                         { "bottom_shell_layers_transition", transition } });
+        return std::vector<ModifierBox>{ modifier_box(5., 15., config), modifier_box(25., 35., config) };
+    };
+    Print hard_print, ramp_print;
+    Model hard_model, ramp_model;
+    slice_parts_with_modifiers(hard_print, hard_model, shell_config(wall_generator), parts, modifiers("hard"));
+    slice_parts_with_modifiers(ramp_print, ramp_model, shell_config(wall_generator), parts, modifiers("ramp"));
+
+    // The regions of the modifiers, by their top shell count of 5, and the top shell minimum each is keyed to.
+    auto modifier_regions = [](const Print &print) {
+        const PrintObject  &object = *print.objects().front();
+        std::vector<double> top_base_thicknesses;
+        for (size_t i = 0; i < object.num_printing_regions(); ++ i)
+            if (object.printing_region(i).config().top_shell_layers.value == 5)
+                top_base_thicknesses.emplace_back(object.printing_region(i).ramp_key().top_base_thickness);
+        std::sort(top_base_thicknesses.begin(), top_base_thicknesses.end());
+        return top_base_thicknesses;
+    };
+    CHECK(modifier_regions(hard_print).size() == 1);
+    const std::vector<double> ramp_regions = modifier_regions(ramp_print);
+    REQUIRE(ramp_regions.size() == 2);
+    CHECK_THAT(ramp_regions[0], Catch::Matchers::WithinAbs(0.4, 1e-9));
+    CHECK_THAT(ramp_regions[1], Catch::Matchers::WithinAbs(0.8, 1e-9));
+
+    const std::vector<std::string> hard = gcode_commands(gcode(hard_print));
+    const std::vector<std::string> ramp = gcode_commands(gcode(ramp_print));
+    REQUIRE(hard.size() > 1000);
+    const std::string difference = first_difference(hard, ramp);
     CAPTURE(difference);
     CHECK(difference.empty());
 }

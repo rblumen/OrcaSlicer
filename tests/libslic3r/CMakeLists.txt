@@ -81,6 +81,7 @@ add_executable(${_TEST_NAME}_tests
     test_timeutils.cpp
     test_semver.cpp
     test_voronoi.cpp
+    test_shell_depth_field.cpp
     test_wall_band_insets.cpp
     test_wall_band_shape.cpp
     test_wall_thickness_field.cpp
