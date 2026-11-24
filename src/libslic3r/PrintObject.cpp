@@ -763,8 +763,8 @@ void PrintObject::prepare_infill()
         for (const auto &[modifier, part] : inconsistent)
             this->active_step_add_warning(PrintStateBase::WarningLevel::NON_CRITICAL,
                 // TRN: %1% is the name of a modifier, %2% the name of a part it modifies, %3% the name of their object.
-                Slic3r::format(_u8L("Modifier %1% uses the Hard shell count transitions on part %2% of object %3%: the Ramp transitions "
-                                    "need the same shell settings in every height range."),
+                Slic3r::format(_u8L("Modifier %1% is not ramped on part %2% of object %3%: the Ramp transitions need the same shell "
+                                    "settings in every height range."),
                                modifier->name, part->name, this->model_object()->name));
     }
     m_print->throw_if_canceled();
@@ -2858,8 +2858,8 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                 shell = union_(shell);
             }
         };
-        // Orca: Layer i's surfaces of one side projected to this layer, k layers away, see above. Returns whether the
-        // stock rule projected them, and sets levels_projected if the levels did.
+        // Orca: Layer i's surfaces of one side projected to this layer, k layers away, see above. Sets levels_projected
+        // if the levels projected them.
         auto project = [&](size_t i, size_t k, bool stock_in, ShellSide side, const Polygons &surfaces, bool &levels_projected) {
             const Polygons    &layer_holes = cache_top_botom_regions[i].holes;
             const ShellLevels *levels      = shell_levels_at(shell_levels, i, side);
@@ -2868,7 +2868,7 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                     combine_holes(layer_holes);
                     combine_shells(surfaces);
                 }
-                return stock_in;
+                return;
             }
             if (stock_in) {
                 combine_holes(union_(layer_holes, levels->reach));
@@ -2879,7 +2879,6 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                 combine_shells(intersection(surfaces, level));
                 combine_shells(diff(level, layer_holes));
             }
-            return stock_in;
         };
         // Orca: The anchor below is not added where the levels projected the surfaces instead.
         auto anchor_outside_levels = [&shell_levels](Polygons anchor_area, size_t i, ShellSide side, bool levels_projected) {
@@ -2887,7 +2886,6 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                 return diff(anchor_area, levels->reach);
             return anchor_area;
         };
-        static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
         if (int n_top_layers = counts.top_layers; n_top_layers > 0 || max_top_levels > 1) {
             // Gather top regions projected to this layer.
             coordf_t print_z = layer->print_z;
@@ -2900,10 +2898,10 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                 const bool   stock_in = n_top_layers > 0 && (i < itop || m_layers[i]->print_z - print_z < counts.top_thickness - EPSILON);
                 if (! stock_in && k >= max_top_levels)
                     break;
-                if (project(size_t(i), k, stock_in, ShellSide::Top, cache_top_botom_regions[i].top_surfaces, levels_projected))
-                    at_least_one_top_projected = true;
+                project(size_t(i), k, stock_in, ShellSide::Top, cache_top_botom_regions[i].top_surfaces, levels_projected);
+                at_least_one_top_projected |= stock_in;
             }
-            if (!at_least_one_top_projected && idx_layer + 1 < cache_top_botom_regions.size()) {
+            if (n_top_layers > 0 && !at_least_one_top_projected && idx_layer + 1 < cache_top_botom_regions.size()) {
                 // Lets consider this a special case - with only 1 top solid and minimal shell thickness settings, the
                 // boundaries of solid layers are not anchored over/under perimeters, so lets fix it by adding at least one
                 // perimeter width of area
@@ -2912,11 +2910,6 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                                                     to_polygons(m_layers[idx_layer + 1]->lslices));
                 combine_shells(anchor_outside_levels(std::move(anchor_area), idx_layer + 1, ShellSide::Top, levels_projected));
             }
-
-            if (one_more_layer_below_top_bottom_surfaces)
-                if (i < int(cache_top_botom_regions.size()) &&
-                    (i <= itop || m_layers[i]->bottom_z() - print_z < counts.top_thickness - EPSILON))
-                    combine_holes(cache_top_botom_regions[i].holes);
         }
         if (int n_bottom_layers = counts.bottom_layers; n_bottom_layers > 0 || max_bottom_levels > 1) {
             // Gather bottom regions projected to this layer.
@@ -2931,21 +2924,16 @@ void PrintObject::discover_vertical_shells(const std::vector<LayerShellLevels> &
                     (i > ibottom || bottom_z - m_layers[i]->bottom_z() < counts.bottom_thickness - EPSILON);
                 if (! stock_in && k >= max_bottom_levels)
                     break;
-                if (project(size_t(i), k, stock_in, ShellSide::Bottom, cache_top_botom_regions[i].bottom_surfaces, levels_projected))
-                    at_least_one_bottom_projected = true;
+                project(size_t(i), k, stock_in, ShellSide::Bottom, cache_top_botom_regions[i].bottom_surfaces, levels_projected);
+                at_least_one_bottom_projected |= stock_in;
             }
 
-            if (!at_least_one_bottom_projected && idx_layer > 0) {
+            if (n_bottom_layers > 0 && !at_least_one_bottom_projected && idx_layer > 0) {
                 Polygons anchor_area = intersection(expand(cache_top_botom_regions[idx_layer].bottom_surfaces,
                                                            layerm->flow(frExternalPerimeter).scaled_spacing()),
                                                     to_polygons(m_layers[idx_layer - 1]->lslices));
                 combine_shells(anchor_outside_levels(std::move(anchor_area), idx_layer - 1, ShellSide::Bottom, levels_projected));
             }
-
-            if (one_more_layer_below_top_bottom_surfaces)
-                if (i >= 0 &&
-                    (i > ibottom || bottom_z - m_layers[i]->print_z < counts.bottom_thickness - EPSILON))
-                    combine_holes(cache_top_botom_regions[i].holes);
         }
     };
     std::vector<std::vector<ShellAccumulation>> shell_accumulations(top_bottom_surfaces_all_regions ? num_layers : 0);

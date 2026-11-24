@@ -892,7 +892,9 @@ TEST_CASE("A modifier on the Ramp top shell transition thinning the shell to non
                                                             { top_ramp_modifier({ { "top_shell_layers", 0 } }) });
     REQUIRE(object.layers().size() == 20);
     const ShellProbe probe(object);
-    CHECK(probe.top_depth(30.) == 0);
+    const size_t top = object.layers().size() - 1;
+    CHECK_FALSE(probe.solid(top - 1, probe.at(30., 10.)));
+    CHECK_FALSE(probe.solid(top - 2, probe.at(30., 10.)));
     CHECK(probe.top_depth(45.) == 3);
     CHECK(probe.top_depth(15.) == 3);
     // Half a millimetre out, n = 0.5: the top layer only. Stock has the strap's 3 layers right up to the modifier.
@@ -901,7 +903,6 @@ TEST_CASE("A modifier on the Ramp top shell transition thinning the shell to non
     // Layer 1 below the top is in the shell from 1 mm out, so from x = 39 it runs 3 mm towards the modifier, to within the
     // 0.5 mm grid the field is sampled on. Layer 2, from 2 mm out, lies over sparse infill, and bridge_over_infill() widens
     // it to anchor it, so it is not checked here.
-    const size_t top = object.layers().size() - 1;
     CHECK_THAT(probe.solid_run(top - 1, 39., -1.), Catch::Matchers::WithinAbs(3., 0.5));
     CHECK_THAT(probe.solid_run(top - 1, 21., 1.), Catch::Matchers::WithinAbs(3., 0.5));
 }
@@ -991,4 +992,31 @@ TEST_CASE("A Ramp top shell modifier on a slope deepens the shell under the slop
         CHECK(probe.top_depth(38., y) > plain_probe.top_depth(38., y));
         CHECK(probe.top_depth(38., y) < probe.top_depth(30., y));
     }
+}
+
+// A region with no top shell layers has no top shell to anchor, so on an object that also has a Ramp zone it still gets
+// nothing under its top surfaces outside the reach. The step is at x = 10, 15 mm from the modifier and well beyond its
+// ramp; the top of the lower part at layer 9 would otherwise get a ring of solid infill at the foot of the step.
+TEST_CASE("A region without top shell layers gets no anchor outside the reach of a Ramp zone", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    CAPTURE(ensure_vertical_shell_thickness);
+
+    DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
+    config.set_deserialize_strict({ { "top_shell_layers", 0 }, { "top_shell_thickness", 0. } });
+    auto parts = []() {
+        TriangleMesh step = make_cube(10., 20., 2.);
+        step.translate(0.f, 0.f, 2.f);
+        return std::vector<TriangleMesh>{ make_cube(60., 20., 2.), std::move(step) };
+    };
+    Print plain_print, print;
+    Model plain_model, model;
+    const PrintObject &plain  = slice_meshes_with_modifiers(plain_print, plain_model, config, parts(), {});
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, parts(), { top_ramp_modifier() });
+    REQUIRE(object.layers().size() == 20);
+    const ShellProbe plain_probe(plain);
+    const ShellProbe probe(object);
+    const Point      foot = probe.at(9.8, 10.);
+    CHECK_FALSE(plain_probe.solid(9, plain_probe.at(9.8, 10.)));
+    CHECK_FALSE(probe.solid(9, foot));
 }
