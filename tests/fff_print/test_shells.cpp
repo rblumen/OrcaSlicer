@@ -13,11 +13,13 @@
 #include "libslic3r/PrintBase.hpp"
 #include "libslic3r/PrintConfig.hpp"
 #include "libslic3r/ShellDepthField.hpp"
+#include "libslic3r/Surface.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
 
+#include <admesh/stl.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <algorithm>
 #include <cstddef>
@@ -79,6 +81,15 @@ struct ModifierBox
 // A modifier over the whole height of the parts.
 ModifierBox modifier_box(double x0, double x1, const DynamicPrintConfig &config) { return { x0, x1, -1., 3., config }; }
 
+void add_modifiers(ModelObject &object, const std::vector<ModifierBox> &modifiers)
+{
+    for (const ModifierBox &box : modifiers) {
+        TriangleMesh mesh = make_cube(box.x1 - box.x0, 30., box.z1 - box.z0);
+        mesh.translate(float(box.x0), -5.f, float(box.z0));
+        object.add_volume(std::move(mesh), ModelVolumeType::PARAMETER_MODIFIER, false)->config.apply(box.config);
+    }
+}
+
 // Touching 20x20x2 parts side by side from x = 0, the i-th at x = 20i..20i+20 with the config part_configs[i], and the
 // modifiers in the order given. `edit` may change the object before it is applied. Only applied, not processed.
 void apply_parts_with_modifiers(Print &print, Model &model, const DynamicPrintConfig &config, const std::vector<DynamicPrintConfig> &part_configs,
@@ -95,11 +106,7 @@ void apply_parts_with_modifiers(Print &print, Model &model, const DynamicPrintCo
         }
         part->config.apply(part_configs[i]);
     }
-    for (const ModifierBox &box : modifiers) {
-        TriangleMesh mesh = make_cube(box.x1 - box.x0, 30., box.z1 - box.z0);
-        mesh.translate(float(box.x0), -5.f, float(box.z0));
-        object->add_volume(std::move(mesh), ModelVolumeType::PARAMETER_MODIFIER, false)->config.apply(box.config);
-    }
+    add_modifiers(*object, modifiers);
     if (edit)
         edit(*object);
     print.apply(model, config);
@@ -111,6 +118,101 @@ Print &slice_parts_with_modifiers(Print &print, Model &model, const DynamicPrint
     apply_parts_with_modifiers(print, model, config, part_configs, modifiers, edit);
     print.process();
     return print;
+}
+
+// One object of the given parts, in the frame they are given in, with the modifiers in the order given, sliced.
+const PrintObject &slice_meshes_with_modifiers(Print &print, Model &model, const DynamicPrintConfig &config, std::vector<TriangleMesh> parts,
+                                               const std::vector<ModifierBox> &modifiers)
+{
+    Test::init_print({ parts.front() }, print, model, config, nullptr, false);
+    ModelObject *object = model.objects.front();
+    for (size_t i = 1; i < parts.size(); ++ i)
+        object->add_volume(std::move(parts[i]), ModelVolumeType::MODEL_PART, false);
+    add_modifiers(*object, modifiers);
+    print.apply(model, config);
+    print.process();
+    return *print.objects().front();
+}
+
+// Samples the solid infill of a sliced object, at points given in mm from the corner of its bounding box in XY.
+struct ShellProbe
+{
+    const PrintObject &object;
+    Point              origin;
+
+    explicit ShellProbe(const PrintObject &object) : object(object)
+    {
+        BoundingBox box;
+        for (const Layer *layer : object.layers())
+            box.merge(get_extents(layer->lslices));
+        origin = box.min;
+    }
+
+    Point at(double x, double y) const { return Point(origin.x() + scaled(x), origin.y() + scaled(y)); }
+    // Whether any region fills the layer at p, with infill of a type passing `filter`, rather than walls or nothing.
+    bool filled(size_t layer, const Point &p, bool (*filter)(const Surface &)) const
+    {
+        for (const LayerRegion *layerm : object.get_layer(int(layer))->regions())
+            for (const Surface &surface : layerm->fill_surfaces.surfaces)
+                if (filter(surface) && surface.expolygon.contains(p))
+                    return true;
+        return false;
+    }
+    bool inside(size_t layer, const Point &p) const { return this->filled(layer, p, [](const Surface &) { return true; }); }
+    // Top, bottom, bridge or internal solid infill.
+    bool solid(size_t layer, const Point &p) const { return this->filled(layer, p, [](const Surface &surface) { return surface.is_solid(); }); }
+    // How many layers in a row are solid at (x, y), from the topmost (bottommost) layer filled there down (up). On a slope
+    // the layers above (below) only wall the point.
+    size_t top_depth(double x, double y = 10.) const
+    {
+        const Point p = this->at(x, y);
+        int         l = int(object.layers().size()) - 1;
+        while (l >= 0 && ! this->inside(size_t(l), p))
+            -- l;
+        size_t depth = 0;
+        for (; l >= 0 && this->solid(size_t(l), p); -- l)
+            ++ depth;
+        return depth;
+    }
+    size_t bottom_depth(double x, double y = 10.) const
+    {
+        const Point p = this->at(x, y);
+        size_t      l = 0;
+        while (l < object.layers().size() && ! this->inside(l, p))
+            ++ l;
+        size_t depth = 0;
+        for (; l < object.layers().size() && this->solid(l, p); ++ l)
+            ++ depth;
+        return depth;
+    }
+    // How far in mm the solid infill of a layer runs on along y = 10 from x, in the direction dir (+1 or -1).
+    double solid_run(size_t layer, double x, double dir) const
+    {
+        double d = 0.;
+        while (d < 20. && this->solid(layer, this->at(x + dir * d, 10.)))
+            d += 0.05;
+        return d;
+    }
+};
+
+// The fixture of the Shell Ramp projection tests: a 60 x 20 x 4 mm strap, 20 layers of 0.2 mm, its top and bottom shells
+// 3 layers with a 0.4 mm and 0.2 mm minimum, so 0.6 mm deep, and a modifier box over x = 25..35 through its whole height.
+DynamicPrintConfig projection_config(const char *ensure_vertical_shell_thickness, const char *wall_generator = "arachne")
+{
+    DynamicPrintConfig config = shell_config(wall_generator);
+    config.set_deserialize_strict({ { "ensure_vertical_shell_thickness", ensure_vertical_shell_thickness } });
+    return config;
+}
+
+// A modifier over x = 25..35 setting a 7 layer (1.4 mm) top shell on the Ramp with a taper ratio of 5: its ramp runs
+// (1.4 - 0.6) * 5 = 4 mm outside it, over which the shell steps from 7 layers down to 3, the layer k layers below the top
+// in the shell out to 7 - k mm from the modifier.
+ModifierBox top_ramp_modifier(std::initializer_list<ConfigBase::SetDeserializeItem> items = { { "top_shell_layers", 7 } }, double z0 = -1.)
+{
+    DynamicPrintConfig config;
+    config.set_deserialize_strict({ { "top_shell_layers_transition", "ramp" }, { "top_shell_ramp_taper_ratio", 5. } });
+    config.set_deserialize_strict(items);
+    return { 25., 35., z0, 7., config };
 }
 
 // One part, of the process's settings.
@@ -438,10 +540,13 @@ TEST_CASE("A modifier on the Ramp shell transition with a taper ratio of 0 warns
 TEST_CASE("Without a modifier changing a shell on the Ramp transition the G-code is that of a slice without the Ramp settings", "[Shells][ShellRamp]")
 {
     const char       *wall_generator = GENERATE("classic", "arachne");
+    // Both shell projections: discover_vertical_shells() at ensure_all, discover_horizontal_shells() otherwise.
+    const char       *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
     const std::string case_name      = GENERATE("modifiers on Hard", "Ramp set in the process and on the part", "Ramp modifier changing no count");
-    CAPTURE(wall_generator, case_name);
+    CAPTURE(wall_generator, ensure_vertical_shell_thickness, case_name);
 
-    const DynamicPrintConfig plain_config = shell_config(wall_generator);
+    DynamicPrintConfig plain_config = shell_config(wall_generator);
+    plain_config.set_deserialize_strict({ { "ensure_vertical_shell_thickness", ensure_vertical_shell_thickness } });
     DynamicPrintConfig       keyed_config = plain_config;
     std::vector<ModifierBox> plain_modifiers, keyed_modifiers;
     if (case_name == "modifiers on Hard") {
@@ -677,13 +782,9 @@ TEST_CASE("The bottom shell levels of a print with a thinner first layer count l
 }
 
 // Two modifiers with the same config, which sets the top shell minimum, over parts with a top shell minimum of 0.4 and
-// 0.8 mm: on the Ramp they are keyed apart into two regions, on Hard they share one. Nothing reads the key's shell counts
-// yet, so the G-code is the same.
-TEST_CASE("Shell Ramp modifiers split over parts with different shell thickness print as on Hard", "[Shells][ShellRamp]")
+// 0.8 mm: on the Ramp they are keyed apart into two regions, each tapering to its own part's shell, on Hard they share one.
+TEST_CASE("Shell Ramp modifiers over parts with different shell thickness get a region per part", "[Shells][ShellRamp]")
 {
-    const char *wall_generator = GENERATE("classic", "arachne");
-    CAPTURE(wall_generator);
-
     const std::vector<DynamicPrintConfig> parts { part_config({ { "top_shell_thickness", 0.4 } }), part_config({ { "top_shell_thickness", 0.8 } }) };
     auto modifiers = [](const char *transition) {
         const DynamicPrintConfig config = shell_modifier_config({ { "top_shell_thickness", 0.4 }, { "top_shell_layers_transition", transition },
@@ -692,8 +793,8 @@ TEST_CASE("Shell Ramp modifiers split over parts with different shell thickness 
     };
     Print hard_print, ramp_print;
     Model hard_model, ramp_model;
-    slice_parts_with_modifiers(hard_print, hard_model, shell_config(wall_generator), parts, modifiers("hard"));
-    slice_parts_with_modifiers(ramp_print, ramp_model, shell_config(wall_generator), parts, modifiers("ramp"));
+    apply_parts_with_modifiers(hard_print, hard_model, shell_config(), parts, modifiers("hard"));
+    apply_parts_with_modifiers(ramp_print, ramp_model, shell_config(), parts, modifiers("ramp"));
 
     // The regions of the modifiers, by their top shell count of 5, and the top shell minimum each is keyed to.
     auto modifier_regions = [](const Print &print) {
@@ -710,11 +811,184 @@ TEST_CASE("Shell Ramp modifiers split over parts with different shell thickness 
     REQUIRE(ramp_regions.size() == 2);
     CHECK_THAT(ramp_regions[0], Catch::Matchers::WithinAbs(0.4, 1e-9));
     CHECK_THAT(ramp_regions[1], Catch::Matchers::WithinAbs(0.8, 1e-9));
+}
 
-    const std::vector<std::string> hard = gcode_commands(gcode(hard_print));
-    const std::vector<std::string> ramp = gcode_commands(gcode(ramp_print));
-    REQUIRE(hard.size() > 1000);
-    const std::string difference = first_difference(hard, ramp);
-    CAPTURE(difference);
-    CHECK(difference.empty());
+// The tests below run on both shell projections: discover_vertical_shells() at ensure_all, discover_horizontal_shells()
+// otherwise. See projection_config() and top_ramp_modifier() for the fixture.
+
+// Stock builds the modifier's 7 layers under it too, but not the ramp: just outside the modifier, where n = 6.75, the
+// shell is still 7 layers deep. Well beyond the 4 mm ramp it is the strap's 3.
+TEST_CASE("A modifier on the Ramp top shell transition deepens the shell under it and ramps it back outside", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    const char *wall_generator                  = GENERATE("classic", "arachne");
+    CAPTURE(ensure_vertical_shell_thickness, wall_generator);
+
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, projection_config(ensure_vertical_shell_thickness, wall_generator),
+                                                            { make_cube(60., 20., 4.) }, { top_ramp_modifier() });
+    REQUIRE(object.layers().size() == 20);
+    const ShellProbe probe(object);
+    CHECK(probe.top_depth(30.) == 7);
+    // Next to the modifier the layer under the shell can be solid too, where its infill meets the modifier region's.
+    CHECK(probe.top_depth(35.25) >= 7);
+    CHECK(probe.top_depth(24.75) >= 7);
+    CHECK(probe.top_depth(45.) == 3);
+    CHECK(probe.top_depth(15.) == 3);
+}
+
+// The layer k layers below the top is in the shell out to 7 - k mm from the modifier, on both sides of it, to within the
+// 0.5 mm grid the field is sampled on. The deepest of them, 6 layers down, lies over sparse infill: bridge_over_infill()
+// turns it into an internal bridge and widens it to anchor it, so it is only checked to reach its level.
+// The same holds with the modifier's 1.4 mm deep shell set as a minimum thickness over 3 layers: with the strap's
+// minimum at 0.6 mm, its 3 layers' depth, the two rules then agree at every point of the ramp.
+TEST_CASE("Across the ramp of a Ramp top shell modifier the shell steps down one layer per taper length", "[Shells][ShellRamp]")
+{
+    const char       *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    const std::string modifier_shell                  = GENERATE("7 layers", "1.4 mm minimum");
+    CAPTURE(ensure_vertical_shell_thickness, modifier_shell);
+
+    DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
+    config.set_deserialize_strict({ { "top_shell_thickness", 0.6 } });
+    const ModifierBox modifier = modifier_shell == "7 layers" ? top_ramp_modifier() :
+                                                                top_ramp_modifier({ { "top_shell_layers", 3 }, { "top_shell_thickness", 1.4 } });
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, { make_cube(60., 20., 4.) }, { modifier });
+    REQUIRE(object.layers().size() == 20);
+    const ShellProbe probe(object);
+    CHECK(probe.top_depth(30.) == 7);
+    CHECK(probe.top_depth(45.) == 3);
+
+    const double grid = 0.5;
+    for (size_t k = 3; k <= 6; ++ k) {
+        const size_t layer    = object.layers().size() - 1 - k;
+        const double expected = 7. - double(k);
+        CAPTURE(k);
+        const double right = probe.solid_run(layer, 35., 1.);
+        const double left  = probe.solid_run(layer, 25., -1.);
+        CHECK(right > expected - grid);
+        CHECK(left > expected - grid);
+        if (k < 6) {
+            CHECK(right < expected + grid);
+            CHECK(left < expected + grid);
+        }
+    }
+    // Below the shell, nothing outside the modifier.
+    CHECK(probe.solid_run(object.layers().size() - 8, 35., 1.) < grid);
+}
+
+// A modifier with no top shell on the Ramp: no solid layer under its top, and outside it the shell ramps from none to the
+// strap's 3 layers over (0.6 - 0) * 5 = 3 mm, n = d / 1 mm. The top layer itself stays the strap's own top surface.
+TEST_CASE("A modifier on the Ramp top shell transition thinning the shell to none ramps it back outside", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    CAPTURE(ensure_vertical_shell_thickness);
+
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, projection_config(ensure_vertical_shell_thickness), { make_cube(60., 20., 4.) },
+                                                            { top_ramp_modifier({ { "top_shell_layers", 0 } }) });
+    REQUIRE(object.layers().size() == 20);
+    const ShellProbe probe(object);
+    CHECK(probe.top_depth(30.) == 0);
+    CHECK(probe.top_depth(45.) == 3);
+    CHECK(probe.top_depth(15.) == 3);
+    // Half a millimetre out, n = 0.5: the top layer only. Stock has the strap's 3 layers right up to the modifier.
+    CHECK(probe.top_depth(35.5) < 3);
+    CHECK(probe.top_depth(24.5) < 3);
+    // Layer 1 below the top is in the shell from 1 mm out, so from x = 39 it runs 3 mm towards the modifier, to within the
+    // 0.5 mm grid the field is sampled on. Layer 2, from 2 mm out, lies over sparse infill, and bridge_over_infill() widens
+    // it to anchor it, so it is not checked here.
+    const size_t top = object.layers().size() - 1;
+    CHECK_THAT(probe.solid_run(top - 1, 39., -1.), Catch::Matchers::WithinAbs(3., 0.5));
+    CHECK_THAT(probe.solid_run(top - 1, 21., 1.), Catch::Matchers::WithinAbs(3., 0.5));
+}
+
+// The bottom shell mirrors the top: a 7 layer bottom shell on the Ramp deepens the 3 layers of the strap's bottom under
+// the modifier and ramps back outside it, over the bed and over an overhang alike. For the overhang, the strap stands
+// 2 mm up on a 10 mm wide pillar at x = 0..10, so its bottom is bridged from x = 10 on.
+TEST_CASE("A modifier on the Ramp bottom shell transition deepens the bottom shell under it and ramps it back outside", "[Shells][ShellRamp]")
+{
+    const char       *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    const std::string bottom                          = GENERATE("on the bed", "overhanging");
+    CAPTURE(ensure_vertical_shell_thickness, bottom);
+
+    std::vector<TriangleMesh> parts;
+    if (bottom == "on the bed")
+        parts.emplace_back(make_cube(60., 20., 4.));
+    else {
+        parts.emplace_back(make_cube(10., 20., 2.));
+        TriangleMesh strap = make_cube(60., 20., 4.);
+        strap.translate(0.f, 0.f, 2.f);
+        parts.emplace_back(std::move(strap));
+    }
+    const ModifierBox modifier { 25., 35., -1., 7., part_config({ { "bottom_shell_layers", 7 }, { "bottom_shell_layers_transition", "ramp" },
+                                                                   { "bottom_shell_ramp_taper_ratio", 5. } }) };
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, projection_config(ensure_vertical_shell_thickness), std::move(parts), { modifier });
+    REQUIRE(object.layers().size() == (bottom == "on the bed" ? 20 : 30));
+    const ShellProbe probe(object);
+    CHECK(probe.bottom_depth(30.) == 7);
+    CHECK(probe.bottom_depth(35.25) >= 7);
+    CHECK(probe.bottom_depth(24.75) >= 7);
+    CHECK(probe.bottom_depth(45.) == 3);
+    CHECK(probe.bottom_depth(15.) == 3);
+}
+
+// The modifier covers only the top 2 layers of the strap, so its region does not reach down the 7 layers of its shell.
+// The shell is defined on the surface, so the zone still gives 7 layers under its top: on the ensure_all projection
+// because it projects the surfaces of every region, on the other one because the other regions' surfaces within the
+// reach are projected too.
+TEST_CASE("A Ramp top shell modifier shorter than its shell still gives its depth under its top", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    CAPTURE(ensure_vertical_shell_thickness);
+
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, projection_config(ensure_vertical_shell_thickness), { make_cube(60., 20., 4.) },
+                                                            { top_ramp_modifier({ { "top_shell_layers", 7 } }, 3.55) });
+    REQUIRE(object.layers().size() == 20);
+    const ShellProbe probe(object);
+    CHECK(probe.top_depth(30.) == 7);
+    CHECK(probe.top_depth(35.25) >= 7);
+    CHECK(probe.top_depth(45.) == 3);
+}
+
+// A wedge, its top sloping up from 1 mm at y = 0 to 4 mm at y = 20, so the sloped face drops a 0.2 mm layer every 1.33 mm.
+// The modifier's zone covers its slope over x = 25..35. Under the slope the shell is the modifier's 7 layers in the zone,
+// tapers across the ramp, and is what the wedge gets without the modifier well beyond it. Counted from the topmost layer
+// filled at a point, which on a slope may lie under the walls of the layer above, so one layer short of the shell.
+TEST_CASE("A Ramp top shell modifier on a slope deepens the shell under the slope", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    CAPTURE(ensure_vertical_shell_thickness);
+
+    auto wedge = []() {
+        indexed_triangle_set its = its_make_cube(60., 20., 4.);
+        for (stl_vertex &v : its.vertices)
+            if (v.y() == 0.f && v.z() == 4.f)
+                v.z() = 1.f;
+        return TriangleMesh(std::move(its));
+    };
+    const DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
+    Print plain_print, print;
+    Model plain_model, model;
+    const PrintObject &plain  = slice_meshes_with_modifiers(plain_print, plain_model, config, { wedge() }, {});
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, { wedge() }, { top_ramp_modifier() });
+    const ShellProbe   plain_probe(plain);
+    const ShellProbe   probe(object);
+    for (const double y : { 6., 10., 14. }) {
+        CAPTURE(y);
+        CHECK(plain_probe.top_depth(30., y) <= 4);
+        CHECK(probe.top_depth(30., y) >= 6);
+        CHECK(probe.top_depth(10., y) == plain_probe.top_depth(10., y));
+        CHECK(probe.top_depth(50., y) == plain_probe.top_depth(50., y));
+        // 3 mm into the ramp, n = 4.
+        CHECK(probe.top_depth(38., y) > plain_probe.top_depth(38., y));
+        CHECK(probe.top_depth(38., y) < probe.top_depth(30., y));
+    }
 }

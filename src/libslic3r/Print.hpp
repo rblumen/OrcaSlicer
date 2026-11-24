@@ -744,10 +744,11 @@ private:
     // Has any support (not counting the raft).
     void detect_surfaces_type();
     void process_external_surfaces();
-    void discover_vertical_shells();
+    // Orca: shell_levels are the Shell Ramp levels of every layer, see make_shell_levels(), empty without a shell depth field.
+    void discover_vertical_shells(const std::vector<LayerShellLevels> &shell_levels);
     void bridge_over_infill();
     void clip_fill_surfaces();
-    void discover_horizontal_shells();
+    void discover_horizontal_shells(const std::vector<LayerShellLevels> &shell_levels);
     void combine_infill();
     void _generate_support_material();
     FillAdaptive::RegionOctrees prepare_adaptive_infill_data(
