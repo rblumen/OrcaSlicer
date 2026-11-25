@@ -20,8 +20,10 @@
 #include <cstdlib>
 #include <set>
 #include <map>
+#include <initializer_list>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 #include <wx/msgdlg.h>
 #include <wx/string.h>
@@ -1241,6 +1243,17 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("slowdown_for_curled_perimeters", has_overhang_speed, variant_index, overhang_speed_reason);
 
     toggle_line("flush_into_objects", !is_global_config, -1, _L("This setting is available in object settings rather than global print settings."));
+
+    // Orca: the count transitions act only on modifiers, see TabPrintModel::toggle_options(), and each taper ratio only on its Ramp.
+    const wxString modifier_reason = _L("This setting is available in modifier settings rather than global print settings.");
+    for (auto [transition, taper_ratio] : { std::pair{ "wall_loops_transition", "wall_ramp_taper_ratio" },
+                                            std::pair{ "top_shell_layers_transition", "top_shell_ramp_taper_ratio" },
+                                            std::pair{ "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio" } }) {
+        toggle_line(transition, !is_global_config, -1, modifier_reason);
+        toggle_line(taper_ratio, !is_global_config, -1, modifier_reason);
+        toggle_field(taper_ratio, config->opt_enum<CountTransition>(transition) == CountTransition::Ramp, -1,
+                     _L("Set the count transition to Ramp to edit its taper ratio."));
+    }
 
     toggle_line("support_interface_not_for_body",config->opt_int("support_interface_filament")&&!config->opt_int("support_filament"), -1,
                 _L("Select a specific support interface filament and use the default support filament to show this setting."));
