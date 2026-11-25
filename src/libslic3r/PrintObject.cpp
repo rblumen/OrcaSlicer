@@ -4433,6 +4433,16 @@ void PrintObject::bridge_over_infill()
                             
                             // Overlapping portion found -> this will become the second internal bridge
                             if (!overlap.empty()) {
+                                // Calculate leftover polygons = s->expolygon - bridging_union
+                                ExPolygons leftover = diff_ex(s->expolygon, bridging_union, ApplySafetyOffset::Yes);
+                                // Shrink + expand to remove trivial polygons
+                                leftover = offset_ex(shrink_ex(leftover, offset_distance), offset_distance);
+                                // Orca: the parts of solid infill next to the bridge that both openings drop, such as a strip
+                                // narrower than two lines between the bridge and the edge of the solid, would leave a hole in
+                                // it. They join the second bridge instead.
+                                if (s->surface_type == stInternalSolid)
+                                    overlap = intersection_ex(diff_ex(s->expolygon, leftover), offset_ex(bridging_union, 2.f * offset_distance));
+
                                 // Create second bridge surface
                                 Surface tmp{*s, {}};
                                 tmp.surface_type = stSecondInternalBridge;
@@ -4442,11 +4452,6 @@ void PrintObject::bridge_over_infill()
                                 for (const ExPolygon &ep : overlap) {
                                     next_new_surfaces.emplace_back(tmp, ep);
                                 }
-                                
-                                // Calculate leftover polygons = s->expolygon - bridging_union
-                                ExPolygons leftover = diff_ex(s->expolygon, bridging_union, ApplySafetyOffset::Yes);
-                                // Shrink + expand to remove trivial polygons
-                                leftover = offset_ex(shrink_ex(leftover, offset_distance), offset_distance);
                                 
                                 // Leftover polygons exist. Add them to the new surface maintaining their original attributes
                                 if (!leftover.empty()) {
