@@ -20,6 +20,7 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/libslic3r.h"
 
 #include <admesh/stl.h>
 #include <boost/algorithm/string/predicate.hpp>
