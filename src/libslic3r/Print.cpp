@@ -2544,7 +2544,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             const ModelObject *model_object = print_object->model_object();
             auto has_ramp_modifier = [model_object](const char *opt_key) {
                 return std::any_of(model_object->volumes.begin(), model_object->volumes.end(), [opt_key](const ModelVolume *volume) {
-                    const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option(opt_key) : nullptr;
+                    const ConfigOption *transition = volume->is_modifier() ? volume->config.option(opt_key) : nullptr;
                     return transition != nullptr && transition->getInt() == int(CountTransition::Ramp); });
             };
             if (has_ramp_modifier("wall_loops_transition"))
@@ -2566,7 +2566,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
     for (const PrintObject *print_object : m_objects)
         for (const ModelVolume *volume : print_object->model_object()->volumes) {
             if (! wall_ramp_active(m_config, print_object->config()) ||
-                ! volume->is_region_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
+                ! volume->is_modifier() || ! volume->config.has("only_one_wall_top") || ! volume->config.get().opt_bool("only_one_wall_top"))
                 continue;
             const DynamicPrintConfig &cfg = volume->config.get();
             const bool ramp = (cfg.has("wall_loops_transition") ? cfg.opt_enum<CountTransition>("wall_loops_transition") :
@@ -2587,7 +2587,7 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
         const ModelObject *model_object = print_object->model_object();
         if (print_object->config().wall_generator.value == PerimeterGeneratorType::Arachne || classic_ramp_objects.count(model_object) > 0 ||
             std::none_of(model_object->volumes.begin(), model_object->volumes.end(), [](const ModelVolume *volume) {
-                const ConfigOption *transition = volume->is_region_modifier() ? volume->config.option("wall_loops_transition") : nullptr;
+                const ConfigOption *transition = volume->is_modifier() ? volume->config.option("wall_loops_transition") : nullptr;
                 return transition != nullptr && transition->getInt() == int(CountTransition::Ramp); }))
             continue;
         classic_ramp_objects.insert(model_object);

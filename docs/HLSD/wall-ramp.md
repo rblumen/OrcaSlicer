@@ -28,12 +28,14 @@ the modifier:
 The transitions are region options, but they act only on a modifier that sets
 them itself. They are not inherited from the process, the object, a layer range
 or an enclosing modifier, and they do nothing on a part. The settings tab shows
-them only when a modifier volume is selected. Wall and shell ramps are
+them only when a mesh modifier is selected. Wall and shell ramps are
 independent: one modifier can ramp both, or different, overlapping modifiers
 can ramp each.
 
 Painted modifiers are not zone sources: a painted modifier shares its host's
-mesh, so its zone would be the whole part.
+mesh, so its zone would be the whole part. Slicing ignores the transitions on a
+painted modifier: it gets no ramp key and slices like Hard, and validation does
+not check them.
 
 ## The zone and the ramp
 

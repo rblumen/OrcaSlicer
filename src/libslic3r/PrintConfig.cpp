@@ -1575,8 +1575,8 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Strength");
     def->tooltip = L("With the Ramp bottom shell count transition, the length of the ramp per unit of change in bottom shell "
                      "thickness. For example, 10 changes the bottom shell thickness by 1 mm over 10 mm. 0 keeps the hard step.\n\n"
-                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but add solid infill further "
-                     "from the modifier. Lower values keep the ramp short. Start with 10. Orca doesn't choose this value for you, "
+                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but change the solid infill over a "
+                     "larger area around the modifier. Lower values keep the ramp short. Orca doesn't choose this value for you, "
                      "because the best one depends on how the part is loaded.");
     def->min = 0;
     def->mode = comAdvanced;
@@ -6039,8 +6039,8 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Strength");
     def->tooltip = L("With the Ramp wall count transition, the length of the ramp per unit of change in wall thickness. "
                      "For example, 10 changes the wall thickness by 1 mm over 10 mm. 0 keeps the hard step.\n\n"
-                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but add walls further from "
-                     "the modifier. Lower values keep the ramp short. Start with 10. Orca doesn't choose this value for you, "
+                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but change the walls over a larger "
+                     "area around the modifier. Lower values keep the ramp short. Orca doesn't choose this value for you, "
                      "because the best one depends on how the part is loaded.");
     def->min = 0;
     def->mode = comAdvanced;
@@ -8275,8 +8275,8 @@ void PrintConfigDef::init_fff_params()
     def->category = L("Strength");
     def->tooltip = L("With the Ramp top shell count transition, the length of the ramp per unit of change in top shell "
                      "thickness. For example, 10 changes the top shell thickness by 1 mm over 10 mm. 0 keeps the hard step.\n\n"
-                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but add solid infill further "
-                     "from the modifier. Lower values keep the ramp short. Start with 10. Orca doesn't choose this value for you, "
+                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but change the solid infill over a "
+                     "larger area around the modifier. Lower values keep the ramp short. Orca doesn't choose this value for you, "
                      "because the best one depends on how the part is loaded.");
     def->min = 0;
     def->mode = comAdvanced;

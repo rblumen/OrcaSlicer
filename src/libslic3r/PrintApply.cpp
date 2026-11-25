@@ -827,8 +827,11 @@ int  print_region_ref_cnt(const PrintRegion &r) { return r.m_ref_cnt; }
 // layer range or an enclosing modifier. Only Arachne walls follow the wall ramp and spiral vase mode builds none, so when
 // the wall transition is not active (wall_ramp_active()) the modifier keeps the Hard wall transition: its region is not
 // keyed for walls and walls its own outline, see Print::validate(). Likewise for the shells and shell_ramp_active().
+// A painted modifier is never a zone source: it shares its host's mesh, so its zone would be the whole part.
 static RampKey ramp_key(const ModelVolume &volume, const PrintRegion &parent, bool wall_ramp_enabled, bool shell_ramp_enabled)
 {
+    if (! volume.is_modifier())
+        return {};
     auto is_ramp = [&volume](const char *opt_key) {
         const ConfigOption *transition = volume.config.option(opt_key);
         return transition != nullptr && transition->getInt() == int(CountTransition::Ramp);

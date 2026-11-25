@@ -3979,17 +3979,18 @@ void TabPrintModel::toggle_options()
     TabPrint::toggle_options();
     if (!m_active_page)
         return;
-    // Orca: the count transitions act only on modifiers, see PrintApply.cpp ramp_key(), so show them only for modifiers.
-    // Painted modifiers are left out: their zone would be their whole host part, as they share its mesh.
+    // Orca: the count transitions act only on mesh modifiers, see PrintApply.cpp ramp_key(), so show them only for those.
+    // Painted modifiers are no zone sources: they share their host's mesh, so their zone would be the whole part.
     const bool modifiers = !m_object_configs.empty() && std::all_of(m_object_configs.begin(), m_object_configs.end(), [](const auto &object_config) {
         const auto *volume = dynamic_cast<const ModelVolume *>(object_config.first);
         return volume != nullptr && volume->is_modifier();
     });
     if (modifiers)
         return;
+    const wxString reason = _L("This setting is available only in modifier settings.");
     for (const char *opt_key : { "wall_loops_transition", "wall_ramp_taper_ratio", "top_shell_layers_transition",
                                  "top_shell_ramp_taper_ratio", "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio" })
-        toggle_line(opt_key, false, -1, _L("This setting is available only in modifier settings."));
+        toggle_line(opt_key, false, -1, reason);
 }
 
 void TabPrintModel::activate_selected_page(std::function<void()> throw_if_canceled)
