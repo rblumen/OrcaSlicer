@@ -4437,11 +4437,17 @@ void PrintObject::bridge_over_infill()
                                 ExPolygons leftover = diff_ex(s->expolygon, bridging_union, ApplySafetyOffset::Yes);
                                 // Shrink + expand to remove trivial polygons
                                 leftover = offset_ex(shrink_ex(leftover, offset_distance), offset_distance);
-                                // Orca: the parts of solid infill next to the bridge that both openings drop, such as a strip
-                                // narrower than two lines between the bridge and the edge of the solid, would leave a hole in
-                                // it. They join the second bridge instead.
-                                if (s->surface_type == stInternalSolid)
-                                    overlap = intersection_ex(diff_ex(s->expolygon, leftover), offset_ex(bridging_union, 2.f * offset_distance));
+                                // ORCA: the parts of solid infill that neither opening keeps, such as a strip narrower than two
+                                // lines between the bridge and the edge of the solid, would leave a hole in it. Those next to
+                                // the second bridge join it, unless narrower than a line.
+                                if (s->surface_type == stInternalSolid) {
+                                    ExPolygons lost = diff_ex(diff_ex(s->expolygon, overlap), leftover);
+                                    const ExPolygons bridge_grown = offset_ex(overlap, 2.f * float(SCALED_EPSILON));
+                                    for (const ExPolygon &ep : lost)
+                                        if (! shrink_ex({ ep }, 0.5f * offset_distance).empty() && ! intersection_ex(ExPolygons{ ep }, bridge_grown).empty())
+                                            overlap.push_back(ep);
+                                    overlap = union_ex(overlap);
+                                }
 
                                 // Create second bridge surface
                                 Surface tmp{*s, {}};
