@@ -1555,7 +1555,8 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("How the bottom shell depth changes at the boundary of a modifier that sets a different bottom shell "
                      "than the part. The depth counts both Bottom shell layers and Bottom shell thickness.\n\n"
                      "Hard: the depth changes in one step at the modifier's outline.\n"
-                     "Ramp: the depth changes gradually from the part's to the modifier's over a ramp set by the taper ratio. "
+                     "Ramp: the depth changes gradually from the part's to the modifier's over a ramp outside the modifier, "
+                     "set by the taper ratio. Choose Ramp to reinforce an area without a sudden change in stiffness at its edge. "
                      "Ramp can't be used with spiral vase mode.\n\n"
                      "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
                      "and nested modifiers do not inherit it.");
@@ -1573,7 +1574,10 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Bottom shell ramp taper ratio");
     def->category = L("Strength");
     def->tooltip = L("With the Ramp bottom shell count transition, the length of the ramp per unit of change in bottom shell "
-                     "thickness. For example, 10 changes the bottom shell thickness by 1 mm over 10 mm. 0 keeps the hard step.");
+                     "thickness. For example, 10 changes the bottom shell thickness by 1 mm over 10 mm. 0 keeps the hard step.\n\n"
+                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but change the solid infill over a "
+                     "larger area around the modifier. Lower values keep the ramp short. Orca doesn't choose this value for you, "
+                     "because the best one depends on how the part is loaded.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10.));
@@ -6015,7 +6019,8 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("How the wall count changes at the boundary of a modifier that sets more or fewer walls than the part.\n\n"
                      "Hard: the modifier gets closed walls of its own around its outline, including inside the part.\n"
                      "Ramp: the modifier shares the walls of the part, and the wall count changes gradually from the part's "
-                     "to the modifier's over a ramp set by the taper ratio. The other wall settings of the modifier must match the part's. "
+                     "to the modifier's over a ramp outside the modifier, set by the taper ratio. Choose Ramp to reinforce an area "
+                     "without a sudden change in stiffness at its edge. The other wall settings of the modifier must match the part's. "
                      "Ramp needs the Arachne wall generator and can't be used with spiral vase mode.\n\n"
                      "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
                      "and nested modifiers do not inherit it.");
@@ -6033,7 +6038,10 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Wall ramp taper ratio");
     def->category = L("Strength");
     def->tooltip = L("With the Ramp wall count transition, the length of the ramp per unit of change in wall thickness. "
-                     "For example, 10 changes the wall thickness by 1 mm over 10 mm. 0 keeps the hard step.");
+                     "For example, 10 changes the wall thickness by 1 mm over 10 mm. 0 keeps the hard step.\n\n"
+                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but change the walls over a larger "
+                     "area around the modifier. Lower values keep the ramp short. Orca doesn't choose this value for you, "
+                     "because the best one depends on how the part is loaded.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10.));
@@ -8247,7 +8255,8 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = L("How the top shell depth changes at the boundary of a modifier that sets a different top shell "
                      "than the part. The depth counts both Top shell layers and Top shell thickness.\n\n"
                      "Hard: the depth changes in one step at the modifier's outline.\n"
-                     "Ramp: the depth changes gradually from the part's to the modifier's over a ramp set by the taper ratio. "
+                     "Ramp: the depth changes gradually from the part's to the modifier's over a ramp outside the modifier, "
+                     "set by the taper ratio. Choose Ramp to reinforce an area without a sudden change in stiffness at its edge. "
                      "Ramp can't be used with spiral vase mode.\n\n"
                      "This applies only to a modifier that sets it. It has no effect on parts or in the process settings, "
                      "and nested modifiers do not inherit it.");
@@ -8265,7 +8274,10 @@ void PrintConfigDef::init_fff_params()
     def->label = L("Top shell ramp taper ratio");
     def->category = L("Strength");
     def->tooltip = L("With the Ramp top shell count transition, the length of the ramp per unit of change in top shell "
-                     "thickness. For example, 10 changes the top shell thickness by 1 mm over 10 mm. 0 keeps the hard step.");
+                     "thickness. For example, 10 changes the top shell thickness by 1 mm over 10 mm. 0 keeps the hard step.\n\n"
+                     "Higher values make a longer, gentler ramp that spreads the change in stiffness, but change the solid infill over a "
+                     "larger area around the modifier. Lower values keep the ramp short. Orca doesn't choose this value for you, "
+                     "because the best one depends on how the part is loaded.");
     def->min = 0;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(10.));

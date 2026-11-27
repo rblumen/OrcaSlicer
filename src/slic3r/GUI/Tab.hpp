@@ -624,6 +624,8 @@ public:
 protected:
 	virtual void    activate_selected_page(std::function<void()> throw_if_canceled) override;
 
+	void            toggle_options() override;
+
 	virtual void    on_value_change(const std::string& opt_key, const boost::any& value) override;
 
 	virtual void    notify_changed(ObjectBase * object) = 0;

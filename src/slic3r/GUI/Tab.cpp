@@ -3178,6 +3178,8 @@ void TabPrint::build()
     page = add_options_page(L("Strength"), "custom-gcode_strength"); // ORCA: icon only visible on placeholders
         optgroup = page->new_optgroup(L("Walls"), L"param_wall");
         optgroup->append_single_option_line("wall_loops", "strength_settings_walls#wall-loops");
+        optgroup->append_single_option_line("wall_loops_transition", "strength_settings_walls#wall-count-transition");
+        optgroup->append_single_option_line("wall_ramp_taper_ratio", "strength_settings_walls#wall-ramp-taper-ratio");
         optgroup->append_single_option_line("alternate_extra_wall", "strength_settings_walls#alternate-extra-wall");
         optgroup->append_single_option_line("detect_thin_wall", "strength_settings_walls#detect-thin-wall");
 
@@ -3185,6 +3187,8 @@ void TabPrint::build()
 
         optgroup->append_single_option_line("top_shell_layers", "strength_settings_top_bottom_shells#shell-layers");
         optgroup->append_single_option_line("top_shell_thickness", "strength_settings_top_bottom_shells#shell-thickness");
+        optgroup->append_single_option_line("top_shell_layers_transition", "strength_settings_top_bottom_shells#shell-count-transition");
+        optgroup->append_single_option_line("top_shell_ramp_taper_ratio", "strength_settings_top_bottom_shells#shell-ramp-taper-ratio");
         optgroup->append_single_option_line("top_color_penetration_layers", "strength_settings_top_bottom_shells#paint-penetration-layers");
         optgroup->append_single_option_line("top_surface_density", "strength_settings_top_bottom_shells#surface-density");
         optgroup->append_single_option_line("top_surface_pattern", "strength_settings_top_bottom_shells#surface-pattern");
@@ -3195,6 +3199,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("top_surface_expansion_direction", "strength_settings_top_bottom_shells#surface-expansion-direction");
         optgroup->append_single_option_line("bottom_shell_layers", "strength_settings_top_bottom_shells#shell-layers");
         optgroup->append_single_option_line("bottom_shell_thickness", "strength_settings_top_bottom_shells#shell-thickness");
+        optgroup->append_single_option_line("bottom_shell_layers_transition", "strength_settings_top_bottom_shells#shell-count-transition");
+        optgroup->append_single_option_line("bottom_shell_ramp_taper_ratio", "strength_settings_top_bottom_shells#shell-ramp-taper-ratio");
         optgroup->append_single_option_line("bottom_color_penetration_layers", "strength_settings_top_bottom_shells#paint-penetration-layers");
         optgroup->append_single_option_line("bottom_surface_density", "strength_settings_top_bottom_shells#surface-density");
         optgroup->append_single_option_line("bottom_surface_pattern", "strength_settings_top_bottom_shells#surface-pattern");
@@ -3966,6 +3972,25 @@ void TabPrintModel::reset_model_config()
 bool TabPrintModel::has_key(std::string const& key)
 {
     return std::find(m_keys.begin(), m_keys.end(), key) != m_keys.end();
+}
+
+void TabPrintModel::toggle_options()
+{
+    TabPrint::toggle_options();
+    if (!m_active_page)
+        return;
+    // Orca: the count transitions act only on mesh modifiers, see PrintApply.cpp ramp_key(), so show them only for those.
+    // Painted modifiers are no zone sources: they share their host's mesh, so their zone would be the whole part.
+    const bool modifiers = !m_object_configs.empty() && std::all_of(m_object_configs.begin(), m_object_configs.end(), [](const auto &object_config) {
+        const auto *volume = dynamic_cast<const ModelVolume *>(object_config.first);
+        return volume != nullptr && volume->is_modifier();
+    });
+    if (modifiers)
+        return;
+    const wxString reason = _L("This setting is available only in modifier settings.");
+    for (const char *opt_key : { "wall_loops_transition", "wall_ramp_taper_ratio", "top_shell_layers_transition",
+                                 "top_shell_ramp_taper_ratio", "bottom_shell_layers_transition", "bottom_shell_ramp_taper_ratio" })
+        toggle_line(opt_key, false, -1, reason);
 }
 
 void TabPrintModel::activate_selected_page(std::function<void()> throw_if_canceled)

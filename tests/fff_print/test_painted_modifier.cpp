@@ -21,6 +21,7 @@
 #include "libslic3r/libslic3r.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <string>
 #include <utility>
 
@@ -240,4 +241,26 @@ TEST_CASE("A painted modifier without paint changes nothing", "[PaintedModifier]
     const Layer &layer = scene.layer_at(10.);
     CHECK(area_with_walls(layer, 5) == 0.);
     CHECK_THAT(area_with_walls(layer, default_walls), WithinAbs(400., tolerance));
+}
+
+TEST_CASE("A painted modifier set to a Ramp transition slices like Hard and gets no ramp key", "[PaintedModifier][WallRamp]")
+{
+    Scene scene;
+    scene.config.set_deserialize_strict({{"wall_generator", "arachne"}, {"top_shell_layers", "3"}, {"wall_ramp_taper_ratio", "10"}});
+    ModelVolume &painted_modifier = scene.add_painted_modifier(5, 3.f);
+    painted_modifier.config.set_key_value("wall_loops_transition", new ConfigOptionEnum<CountTransition>(CountTransition::Ramp));
+    painted_modifier.config.set_key_value("top_shell_layers_transition", new ConfigOptionEnum<CountTransition>(CountTransition::Ramp));
+    painted_modifier.config.set_key_value("bottom_shell_layers_transition", new ConfigOptionEnum<CountTransition>(CountTransition::Ramp));
+    scene.slice();
+
+    for (size_t i = 0; i < scene.print.num_print_regions(); ++ i)
+        CHECK(scene.print.get_print_region(i).ramp_key() == RampKey{});
+    const Layer &layer = scene.layer_at(10.);
+    CHECK_THAT(area_with_walls(layer, 5), WithinAbs(band_area, tolerance));
+    CHECK_THAT(area_with_walls(layer, default_walls), WithinAbs(400. - band_area, tolerance));
+
+    // Spiral vase mode rejects a mesh modifier on the Ramp transition, but a painted modifier is no Ramp source.
+    scene.config.set_deserialize_strict({{"spiral_mode", "1"}});
+    scene.print.apply(scene.model, scene.config);
+    CHECK(scene.print.validate().string.find("Ramp") == std::string::npos);
 }
