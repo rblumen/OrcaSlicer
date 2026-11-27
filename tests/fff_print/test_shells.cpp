@@ -5,8 +5,10 @@
 #include <catch2/matchers/catch_matchers_floating_point.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "libslic3r/BoundingBox.hpp"
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/Config.hpp"
 #include "libslic3r/ExPolygon.hpp"
+#include "libslic3r/Flow.hpp"
 #include "libslic3r/Layer.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/Print.hpp"
@@ -18,10 +20,13 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
+#include "libslic3r/libslic3r.h"
 
 #include <admesh/stl.h>
 #include <boost/algorithm/string/predicate.hpp>
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <functional>
 #include <initializer_list>
@@ -29,6 +34,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -193,7 +199,36 @@ struct ShellProbe
             d += 0.05;
         return d;
     }
+    // Where along y = 10 the solid infill of a layer ends, coming from `far` towards x = near; how far that is from near,
+    // or 0 if there is none in between. Unlike solid_run() it does not stop at walls next to near.
+    double solid_edge(size_t layer, double near, double far) const
+    {
+        const double dir = far > near ? 1. : -1.;
+        for (double d = std::abs(far - near); d > 0.; d -= 0.05)
+            if (this->solid(layer, this->at(near + dir * d, 10.)))
+                return d;
+        return 0.;
+    }
 };
+
+// Number of walls a layer lays across its y = 0 side at x mm from its -X side: pieces of walls crossing a 0.02 mm wide
+// strip from 1 mm outside the side to 3 mm inside it, pieces less than 0.1 mm apart counted as one wall.
+size_t walls_across_side(const Layer &layer, double x)
+{
+    const BoundingBox part = get_extents(layer.lslices);
+    const BoundingBox strip(Point(part.min.x() + scaled<coord_t>(x - 0.01), part.min.y() - scaled<coord_t>(1.)),
+                            Point(part.min.x() + scaled<coord_t>(x + 0.01), part.min.y() + scaled<coord_t>(3.)));
+    std::vector<coord_t> depths;
+    for (const LayerRegion *region : layer.regions())
+        for (const Polyline &piece : intersection_pl(region->perimeters.as_polylines(), strip.polygon()))
+            depths.emplace_back((piece.first_point().y() + piece.last_point().y()) / 2);
+    std::sort(depths.begin(), depths.end());
+    size_t walls = 0;
+    for (size_t i = 0; i < depths.size(); ++ i)
+        if (i == 0 || depths[i] - depths[i - 1] > scaled<coord_t>(0.1))
+            ++ walls;
+    return walls;
+}
 
 // The fixture of the Shell Ramp projection tests: a 60 x 20 x 4 mm strap, 20 layers of 0.2 mm, its top and bottom shells
 // 3 layers with a 0.4 mm and 0.2 mm minimum, so 0.6 mm deep, and a modifier box over x = 25..35 through its whole height.
@@ -996,13 +1031,11 @@ TEST_CASE("A Ramp top shell modifier on a slope deepens the shell under the slop
 
 // A region with no top shell layers has no top shell to anchor, so on an object that also has a Ramp zone it still gets
 // nothing under its top surfaces outside the reach. The step is at x = 10, 15 mm from the modifier and well beyond its
-// ramp; the top of the lower part at layer 9 would otherwise get a ring of solid infill at the foot of the step.
+// ramp; the top of the lower part at layer 9 would otherwise get a ring of solid infill at the foot of the step. Only
+// the ensure_all projection adds such an anchor.
 TEST_CASE("A region without top shell layers gets no anchor outside the reach of a Ramp zone", "[Shells][ShellRamp]")
 {
-    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
-    CAPTURE(ensure_vertical_shell_thickness);
-
-    DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
+    DynamicPrintConfig config = projection_config("ensure_all");
     config.set_deserialize_strict({ { "top_shell_layers", 0 }, { "top_shell_thickness", 0. } });
     auto parts = []() {
         TriangleMesh step = make_cube(10., 20., 2.);
@@ -1020,3 +1053,205 @@ TEST_CASE("A region without top shell layers gets no anchor outside the reach of
     CHECK_FALSE(plain_probe.solid(9, plain_probe.at(9.8, 10.)));
     CHECK_FALSE(probe.solid(9, foot));
 }
+
+// The bottom side of the same: a 4 mm strap stands 2 mm up on a pillar at x = 0..10 and has no bottom shell layers, and a
+// modifier deepening the bottom shell to 7 layers on the Ramp over x = 25..35 is 15 mm away. The bottom of the strap
+// at layer 10 would otherwise get a ring of solid infill over the edge of the pillar.
+TEST_CASE("A region without bottom shell layers gets no anchor outside the reach of a Ramp zone", "[Shells][ShellRamp]")
+{
+    DynamicPrintConfig config = projection_config("ensure_all");
+    config.set_deserialize_strict({ { "bottom_shell_layers", 0 }, { "bottom_shell_thickness", 0. } });
+    auto parts = []() {
+        TriangleMesh strap = make_cube(60., 20., 4.);
+        strap.translate(0.f, 0.f, 2.f);
+        return std::vector<TriangleMesh>{ make_cube(10., 20., 2.), std::move(strap) };
+    };
+    const ModifierBox modifier { 25., 35., -1., 7., part_config({ { "bottom_shell_layers", 7 }, { "bottom_shell_layers_transition", "ramp" },
+                                                                   { "bottom_shell_ramp_taper_ratio", 5. } }) };
+    Print plain_print, print;
+    Model plain_model, model;
+    const PrintObject &plain  = slice_meshes_with_modifiers(plain_print, plain_model, config, parts(), {});
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, parts(), { modifier });
+    REQUIRE(object.layers().size() == 30);
+    const ShellProbe plain_probe(plain);
+    const ShellProbe probe(object);
+    REQUIRE(probe.bottom_depth(30.) == 7);
+    CHECK_FALSE(plain_probe.solid(10, plain_probe.at(9.8, 10.)));
+    CHECK_FALSE(probe.solid(10, probe.at(9.8, 10.)));
+}
+
+// One modifier over x = 25..35 reinforcing walls and shells: 4 walls over the strap's 2, and the 7 layer top shell on the
+// Ramp of top_ramp_modifier(). The walls taper over 2 * 5 bead widths, about 4 mm, on the Ramp with Arachne, and step
+// at the modifier on Hard or with Classic, which keeps the hard step. The shell ramps the same either way: the layer k
+// layers below the top is in the shell out to 7 - k mm from the modifier, to within the 0.5 mm grid of the field.
+TEST_CASE("A modifier reinforcing walls and shells ramps each by its own transition", "[Shells][ShellRamp]")
+{
+    struct Variant { const char *wall_generator; const char *wall_transition; };
+    const Variant variant = GENERATE(Variant{ "arachne", "ramp" }, Variant{ "arachne", "hard" }, Variant{ "classic", "ramp" }, Variant{ "classic", "hard" });
+    CAPTURE(variant.wall_generator, variant.wall_transition);
+    const bool walls_ramp = std::string(variant.wall_generator) == "arachne" && std::string(variant.wall_transition) == "ramp";
+
+    ModifierBox modifier = top_ramp_modifier();
+    modifier.config.set_deserialize_strict({ { "wall_loops", 4 }, { "wall_loops_transition", variant.wall_transition }, { "wall_ramp_taper_ratio", 5. } });
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, projection_config("ensure_all", variant.wall_generator),
+                                                            { make_cube(60., 20., 4.) }, { modifier });
+    REQUIRE(object.layers().size() == 20);
+
+    // The walls, half way up.
+    const Layer &layer = *object.get_layer(10);
+    CHECK(walls_across_side(layer, 30.) == 4);
+    CHECK(walls_across_side(layer, 45.) == 2);
+    // From beyond the walls a hard step lays along the modifier's outline at x = 35.
+    bool three_walls = false;
+    for (double x = 36.5; x < 40.; x += 0.1)
+        three_walls = three_walls || walls_across_side(layer, x) == 3;
+    CHECK(three_walls == walls_ramp);
+
+    // The shell.
+    const ShellProbe probe(object);
+    CHECK(probe.top_depth(30.) == 7);
+    CHECK(probe.top_depth(45.) == 3);
+    CHECK(probe.top_depth(15.) == 3);
+    const double grid = 0.5;
+    for (size_t k = 3; k <= 5; ++ k) {
+        CAPTURE(k);
+        const size_t layer_id = object.layers().size() - 1 - k;
+        CHECK_THAT(probe.solid_edge(layer_id, 35., 45.), Catch::Matchers::WithinAbs(7. - double(k), grid));
+        CHECK_THAT(probe.solid_edge(layer_id, 25., 15.), Catch::Matchers::WithinAbs(7. - double(k), grid));
+    }
+}
+
+// The staircase of a thickening top ramp lies over sparse infill at each step. bridge_over_infill() turns a step wider
+// than the support it finds below into an internal bridge, and widens that bridge to anchor it, at most to the step
+// above: going down, the shell only steps inward. It leaves no hole in any layer, also where the extra bridge layer
+// turns the solid over a bridge into a second one, and no bridge narrower than a line. The ramp of top_ramp_modifier()
+// at a taper ratio of rho runs (1.4 - 0.6) * rho mm, so the layer k layers below the top, below the 0.4 mm minimum the
+// strap and the modifier share, is in the shell out to (7 - k) * 0.2 * rho mm from the modifier: 1 mm per layer at 5,
+// 2 mm at 10, wider than the four solid spacings by which a step finds support on the one below. At 6 over 10% sparse
+// infill the extra bridge layer leaves solid strips narrower than a line between the second bridge and the step's edge.
+TEST_CASE("The staircase of a Ramp top shell steps inward going down without holes or bridges narrower than a line", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    const auto [taper_ratio, sparse_infill_density] = GENERATE(table<double, const char *>({ { 5., "15%" }, { 10., "15%" }, { 6., "10%" } }));
+    const char *extra_bridge_layer              = GENERATE("disabled", "apply_to_all");
+    CAPTURE(ensure_vertical_shell_thickness, taper_ratio, sparse_infill_density, extra_bridge_layer);
+
+    DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
+    config.set_deserialize_strict({ { "enable_extra_bridge_layer", extra_bridge_layer }, { "sparse_infill_density", sparse_infill_density } });
+    ModifierBox modifier = top_ramp_modifier();
+    modifier.config.set_deserialize_strict({ { "top_shell_ramp_taper_ratio", taper_ratio } });
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, { make_cube(60., 20., 4.) }, { modifier });
+    REQUIRE(object.layers().size() == 20);
+    const ShellProbe probe(object);
+    const size_t     top = object.layers().size() - 1;
+    // The second bridge layer replaces solid infill, it does not add to the shell.
+    CHECK(probe.top_depth(30.) == 7);
+    CHECK(probe.top_depth(48.) == 3);
+    CHECK(probe.top_depth(12.) == 3);
+
+    const double grid = 0.5;
+    for (const double near : { 35., 25. }) {
+        const double far  = near == 35. ? 48. : 12.;
+        double       above = std::abs(far - near);
+        for (size_t k = 1; k <= 6; ++ k) {
+            CAPTURE(near, k);
+            const double edge  = probe.solid_edge(top - k, near, far);
+            const double level = k < 2 ? std::abs(far - near) : (7. - double(k)) * 0.2 * taper_ratio;
+            CHECK(edge > level - grid);
+            // The anchor of a bridge may overlap the step above by a fraction of a line.
+            CHECK(edge < above + 0.25);
+            above = edge;
+        }
+    }
+    for (size_t k = 0; k <= 8; ++ k) {
+        CAPTURE(k);
+        std::string holes;
+        for (double x = 12.; x <= 48.; x += 0.05)
+            if (! probe.inside(top - k, probe.at(x, 10.)))
+                holes += std::to_string(x) + "; ";
+        CHECK(holes.empty());
+        for (const LayerRegion *layerm : object.get_layer(int(top - k))->regions())
+            for (const Surface &surface : layerm->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternalBridge)
+                    CHECK_FALSE(shrink_ex({ surface.expolygon }, float(0.5 * layerm->flow(frSolidInfill).scaled_spacing())).empty());
+    }
+}
+
+// Infill combination prints the sparse infill of two layers as one where both have it, so a combined layer never takes
+// sparse infill from a layer the staircase of a Ramp top shell made solid, and the shell is the same as without it.
+TEST_CASE("Infill combination keeps the staircase of a Ramp top shell", "[Shells][ShellRamp]")
+{
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    CAPTURE(ensure_vertical_shell_thickness);
+
+    auto slice = [ensure_vertical_shell_thickness](Print &print, Model &model, bool combine) -> const PrintObject & {
+        DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
+        // Two 0.2 mm layers combined into one of 0.4 mm.
+        config.set_deserialize_strict({ { "infill_combination", combine }, { "infill_combination_max_layer_height", "0.4" } });
+        return slice_meshes_with_modifiers(print, model, config, { make_cube(60., 20., 4.) }, { top_ramp_modifier() });
+    };
+    Print plain_print, print;
+    Model plain_model, model;
+    const PrintObject &plain  = slice(plain_print, plain_model, false);
+    const PrintObject &object = slice(print, model, true);
+    REQUIRE(object.layers().size() == 20);
+    auto solid = [](const Layer &layer) {
+        Polygons out;
+        for (const LayerRegion *layerm : layer.regions())
+            for (const Surface &surface : layerm->fill_surfaces.surfaces)
+                if (surface.is_solid())
+                    append(out, to_polygons(surface.expolygon));
+        return union_(out);
+    };
+    const double tiny_area = scaled<double>(0.1) * scaled<double>(0.1);
+    bool         combined  = false;
+    for (size_t i = 0; i < object.layers().size(); ++ i) {
+        CAPTURE(i);
+        const Polygons layer_solid = solid(*object.get_layer(int(i)));
+        const Polygons plain_solid = solid(*plain.get_layer(int(i)));
+        CHECK(area(diff(layer_solid, plain_solid)) < tiny_area);
+        CHECK(area(diff(plain_solid, layer_solid)) < tiny_area);
+        for (const LayerRegion *layerm : object.get_layer(int(i))->regions())
+            for (const Surface &surface : layerm->fill_surfaces.surfaces)
+                if (surface.surface_type == stInternal && surface.thickness_layers > 1) {
+                    combined = true;
+                    for (size_t j = i + 1 - surface.thickness_layers; j <= i; ++ j)
+                        CHECK(area(intersection(to_polygons(surface.expolygon), solid(*object.get_layer(int(j))))) < tiny_area);
+                }
+    }
+    CHECK(combined);
+    const ShellProbe probe(object);
+    CHECK(probe.top_depth(30.) == 7);
+    CHECK(probe.top_depth(45.) == 3);
+}
+
+// With no modifier and no Ramp, a 60 x 20 x 3 mm strap stepping up to 6 mm over x = 30..60 has 15 layers of 0.2 mm under
+// the step, the top 3 of them (12 to 14) its top shell, bridged over the 25% sparse infill at layer 12. The extra bridge
+// layer at layer 13 leaves strips of solid infill between the second bridge and the step's edge that would be holes.
+TEST_CASE("The extra bridge layer under a step leaves no holes in the solid layers above the bridge", "[Shells]")
+{
+    DynamicPrintConfig config = shell_config();
+    config.set_deserialize_strict({ { "enable_extra_bridge_layer", "apply_to_all" }, { "sparse_infill_density", "25%" } });
+    TriangleMesh high = make_cube(30., 20., 6.);
+    high.translate(30.f, 0.f, 0.f);
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, { make_cube(60., 20., 3.), std::move(high) }, {});
+    REQUIRE(object.layers().size() == 30);
+    const ShellProbe probe(object);
+    REQUIRE(probe.filled(12, probe.at(15., 10.), [](const Surface &surface) { return surface.surface_type == stInternalBridge; }));
+    for (size_t layer = 13; layer <= 14; ++ layer) {
+        CAPTURE(layer);
+        std::string holes;
+        for (double x = 2.; x <= 58.; x += 0.05)
+            for (double y = 2.; y <= 18.; y += 0.5)
+                if (! probe.inside(layer, probe.at(x, y)))
+                    holes += std::to_string(x) + ", " + std::to_string(y) + "; ";
+        CHECK(holes.empty());
+    }
+}
+

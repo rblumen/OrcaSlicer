@@ -4433,6 +4433,24 @@ void PrintObject::bridge_over_infill()
                             
                             // Overlapping portion found -> this will become the second internal bridge
                             if (!overlap.empty()) {
+                                // Calculate leftover polygons = s->expolygon - bridging_union
+                                ExPolygons leftover = diff_ex(s->expolygon, bridging_union, ApplySafetyOffset::Yes);
+                                // Shrink + expand to remove trivial polygons
+                                leftover = offset_ex(shrink_ex(leftover, offset_distance), offset_distance);
+                                // ORCA: the parts of solid infill that neither opening keeps, such as a strip narrower than two
+                                // lines between the bridge and the edge of the solid, would leave a hole in it. Those sharing an
+                                // edge with the second bridge join it whatever their width, as a fringe of a bridge at least two
+                                // lines wide. A shared edge longer than half a line, rather than a corner, gives the bridge grown by
+                                // 2 * SCALED_EPSILON an overlap above half a line times that. The others stay out, as in stock.
+                                if (s->surface_type == stInternalSolid) {
+                                    const ExPolygons bridge_grown = offset_ex(overlap, 2.f * float(SCALED_EPSILON));
+                                    const double     min_contact  = 0.5 * double(offset_distance) * 2. * SCALED_EPSILON;
+                                    for (ExPolygon &ep : diff_ex(diff_ex(s->expolygon, overlap), leftover))
+                                        if (area(intersection_ex(ExPolygons{ ep }, bridge_grown)) > min_contact)
+                                            overlap.emplace_back(std::move(ep));
+                                    overlap = union_ex(overlap);
+                                }
+
                                 // Create second bridge surface
                                 Surface tmp{*s, {}};
                                 tmp.surface_type = stSecondInternalBridge;
@@ -4442,11 +4460,6 @@ void PrintObject::bridge_over_infill()
                                 for (const ExPolygon &ep : overlap) {
                                     next_new_surfaces.emplace_back(tmp, ep);
                                 }
-                                
-                                // Calculate leftover polygons = s->expolygon - bridging_union
-                                ExPolygons leftover = diff_ex(s->expolygon, bridging_union, ApplySafetyOffset::Yes);
-                                // Shrink + expand to remove trivial polygons
-                                leftover = offset_ex(shrink_ex(leftover, offset_distance), offset_distance);
                                 
                                 // Leftover polygons exist. Add them to the new surface maintaining their original attributes
                                 if (!leftover.empty()) {
