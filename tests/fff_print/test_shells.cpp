@@ -20,6 +20,7 @@
 #include "libslic3r/TriangleSelector.hpp"
 #include "libslic3r/Point.hpp"
 #include "libslic3r/Polygon.hpp"
+#include "libslic3r/Polyline.hpp"
 #include "libslic3r/libslic3r.h"
 
 #include <admesh/stl.h>
@@ -33,6 +34,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1127,16 +1129,17 @@ TEST_CASE("A modifier reinforcing walls and shells ramps each by its own transit
 // turns the solid over a bridge into a second one, and no bridge narrower than a line. The ramp of top_ramp_modifier()
 // at a taper ratio of rho runs (1.4 - 0.6) * rho mm, so the layer k layers below the top, below the 0.4 mm minimum the
 // strap and the modifier share, is in the shell out to (7 - k) * 0.2 * rho mm from the modifier: 1 mm per layer at 5,
-// 2 mm at 10, wider than the four solid spacings by which a step finds support on the one below.
+// 2 mm at 10, wider than the four solid spacings by which a step finds support on the one below. At 6 over 10% sparse
+// infill the extra bridge layer leaves solid strips narrower than a line between the second bridge and the step's edge.
 TEST_CASE("The staircase of a Ramp top shell steps inward going down without holes or bridges narrower than a line", "[Shells][ShellRamp]")
 {
-    const char  *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
-    const double taper_ratio                     = GENERATE(5., 10.);
-    const char  *extra_bridge_layer              = GENERATE("disabled", "apply_to_all");
-    CAPTURE(ensure_vertical_shell_thickness, taper_ratio, extra_bridge_layer);
+    const char *ensure_vertical_shell_thickness = GENERATE("ensure_all", "none");
+    const auto [taper_ratio, sparse_infill_density] = GENERATE(table<double, const char *>({ { 5., "15%" }, { 10., "15%" }, { 6., "10%" } }));
+    const char *extra_bridge_layer              = GENERATE("disabled", "apply_to_all");
+    CAPTURE(ensure_vertical_shell_thickness, taper_ratio, sparse_infill_density, extra_bridge_layer);
 
     DynamicPrintConfig config = projection_config(ensure_vertical_shell_thickness);
-    config.set_deserialize_strict({ { "enable_extra_bridge_layer", extra_bridge_layer } });
+    config.set_deserialize_strict({ { "enable_extra_bridge_layer", extra_bridge_layer }, { "sparse_infill_density", sparse_infill_density } });
     ModifierBox modifier = top_ramp_modifier();
     modifier.config.set_deserialize_strict({ { "top_shell_ramp_taper_ratio", taper_ratio } });
     Print print;
