@@ -1229,3 +1229,29 @@ TEST_CASE("Infill combination keeps the staircase of a Ramp top shell", "[Shells
     CHECK(probe.top_depth(45.) == 3);
 }
 
+// With no modifier and no Ramp, a 60 x 20 x 3 mm strap stepping up to 6 mm over x = 30..60 has 15 layers of 0.2 mm under
+// the step, the top 3 of them (12 to 14) its top shell, bridged over the 25% sparse infill at layer 12. The extra bridge
+// layer at layer 13 leaves strips of solid infill between the second bridge and the step's edge that would be holes.
+TEST_CASE("The extra bridge layer under a step leaves no holes in the solid layers above the bridge", "[Shells]")
+{
+    DynamicPrintConfig config = shell_config();
+    config.set_deserialize_strict({ { "enable_extra_bridge_layer", "apply_to_all" }, { "sparse_infill_density", "25%" } });
+    TriangleMesh high = make_cube(30., 20., 6.);
+    high.translate(30.f, 0.f, 0.f);
+    Print print;
+    Model model;
+    const PrintObject &object = slice_meshes_with_modifiers(print, model, config, { make_cube(60., 20., 3.), std::move(high) }, {});
+    REQUIRE(object.layers().size() == 30);
+    const ShellProbe probe(object);
+    REQUIRE(probe.filled(12, probe.at(15., 10.), [](const Surface &surface) { return surface.surface_type == stInternalBridge; }));
+    for (size_t layer = 13; layer <= 14; ++ layer) {
+        CAPTURE(layer);
+        std::string holes;
+        for (double x = 2.; x <= 58.; x += 0.05)
+            for (double y = 2.; y <= 18.; y += 0.5)
+                if (! probe.inside(layer, probe.at(x, y)))
+                    holes += std::to_string(x) + ", " + std::to_string(y) + "; ";
+        CHECK(holes.empty());
+    }
+}
+
