@@ -366,55 +366,69 @@ TEST_CASE("Rounded internal bridges end on printed support", "[PrintObject][Inte
     REQUIRE(checked > 0);
 }
 
-TEST_CASE("The extra bridge layer under a step leaves no holes in the solid layers above the bridge", "[PrintObject][InternalBridge][Regression]")
+TEST_CASE("The extra bridge layer under a stepped pyramid keeps the solid infill along the edge of the bridge", "[PrintObject][InternalBridge][Regression]")
 {
-    // Orca: A 60 x 20 x 3 mm strap stepping up to 6 mm over x = 30..60 has 15 layers of 0.2 mm under the step, the top 3
-    // of them (12 to 14) its top shell, bridged over the 25% sparse infill at layer 12. The extra bridge layer at layer 13
-    // leaves strips of solid infill narrower than two lines between the second bridge and the step's edge.
+    // Orca: A 30 x 30 x 2 mm block stepping up 0.2 mm every 1.2 mm on all four sides, like a shallow chamfer or dome, ends
+    // its top shell over the sparse infill one step further in on every layer and bridges it there. The extra bridge layer
+    // over each of those bridges used to drop the ring of solid infill, under two lines wide, between it and the edge of
+    // the top shell, leaving holes about 0.5 mm wide all round. The settings that matter are those of the Bambu Lab P1S
+    // 0.20mm Standard process.
     auto config = DynamicPrintConfig::full_print_config();
-    config.set_deserialize_strict({{"wall_generator", "arachne"},
-                                   {"layer_height", 0.2},
+    config.set_deserialize_strict({{"layer_height", 0.2},
                                    {"initial_layer_print_height", 0.2},
+                                   {"wall_generator", "classic"},
                                    {"wall_loops", 2},
-                                   {"sparse_infill_density", "25%"},
-                                   {"top_shell_layers", 3},
-                                   {"top_shell_thickness", 0},
+                                   {"top_shell_layers", 5},
+                                   {"top_shell_thickness", 1.0},
                                    {"bottom_shell_layers", 3},
                                    {"bottom_shell_thickness", 0},
+                                   {"sparse_infill_density", "15%"},
+                                   {"sparse_infill_pattern", "grid"},
+                                   {"line_width", 0.42},
+                                   {"outer_wall_line_width", 0.42},
+                                   {"inner_wall_line_width", 0.45},
+                                   {"sparse_infill_line_width", 0.45},
+                                   {"internal_solid_infill_line_width", 0.42},
+                                   {"top_surface_line_width", 0.42},
                                    {"ensure_vertical_shell_thickness", "ensure_all"},
                                    {"enable_extra_bridge_layer", "apply_to_all"}});
-    TriangleMesh high = make_cube(30., 20., 6.);
-    high.translate(30.f, 0.f, 0.f);
+    // Ten steps of one 0.2 mm layer each on top of the block's ten layers, the last one 30 - 2 * 10 * 1.2 = 6 mm wide.
+    const size_t steps = 10;
     Print print;
     Model model;
-    init_print({make_cube(60., 20., 3.)}, print, model, config, nullptr, false);
-    model.objects.front()->add_volume(std::move(high), ModelVolumeType::MODEL_PART, false);
+    init_print({make_cube(30., 30., 2.)}, print, model, config, nullptr, false);
+    for (size_t i = 1; i <= steps; ++i) {
+        TriangleMesh step = make_cube(30. - 2.4 * i, 30. - 2.4 * i, 0.2);
+        step.translate(float(1.2 * i), float(1.2 * i), float(1.8 + 0.2 * i));
+        model.objects.front()->add_volume(std::move(step), ModelVolumeType::MODEL_PART, false);
+    }
     print.apply(model, config);
     print.process();
     const PrintObject &object = *print.objects().front();
-    REQUIRE(object.layer_count() == 30);
+    REQUIRE(object.layer_count() == 10 + steps);
 
-    BoundingBox box;
-    for (const Layer *layer : object.layers())
-        box.merge(get_extents(layer->lslices));
-    const auto at = [&box](double x, double y) { return Point(box.min.x() + scaled(x), box.min.y() + scaled(y)); };
-    const auto filled = [&object](size_t layer, const Point &p, bool bridge_only) {
-        for (const LayerRegion *region : object.get_layer(int(layer))->regions())
+    // The holes left by the extra bridge layer run along the edge of the bridge below for many millimetres. Parts of a
+    // region's infill area that belong to no fill surface and are at least 0.2 mm wide must not be that long; compact
+    // pieces at the corners of the top shell or at the ends of the sparse infill are left to the shrink and expand.
+    size_t      bridged_layers = 0;
+    std::string holes;
+    for (const Layer *layer : object.layers()) {
+        bool bridged = false;
+        for (const LayerRegion *region : layer->regions()) {
             for (const Surface &surface : region->fill_surfaces.surfaces)
-                if ((!bridge_only || surface.surface_type == stInternalBridge) && surface.expolygon.contains(p))
-                    return true;
-        return false;
-    };
-    REQUIRE(filled(12, at(15., 10.), true));
-    for (size_t layer = 13; layer <= 14; ++layer) {
-        CAPTURE(layer);
-        std::string holes;
-        for (double x = 2.; x <= 58.; x += 0.05)
-            for (double y = 2.; y <= 18.; y += 0.5)
-                if (!filled(layer, at(x, y), false))
-                    holes += std::to_string(x) + ", " + std::to_string(y) + "; ";
-        CHECK(holes.empty());
+                bridged |= surface.surface_type == stInternalBridge;
+            for (const ExPolygon &hole : opening_ex(diff_ex(region->fill_expolygons, to_polygons(region->fill_surfaces.surfaces)), float(scaled(0.1)))) {
+                const Point size = get_extents(hole).size();
+                if (std::max(size.x(), size.y()) > scaled(2.))
+                    holes += "z " + std::to_string(layer->print_z) + ": " + std::to_string(unscaled(size.x())) + " x " +
+                             std::to_string(unscaled(size.y())) + " mm; ";
+            }
+        }
+        bridged_layers += bridged;
     }
+    REQUIRE(bridged_layers > 0);
+    INFO(holes);
+    CHECK(holes.empty());
 }
 
 TEST_CASE("Enabling separated infill recomputes body origins", "[PrintObject][InternalBridge][Regression]")
